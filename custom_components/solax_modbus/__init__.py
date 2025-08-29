@@ -43,6 +43,7 @@ from homeassistant.helpers import entity_registry as er
 
 RETRIES = 1  #was 6 then 0, which worked also, but 1 is probably the safe choice
 INVALID_START = 99999
+VERBOSE_CYCLES = 20
 
 
 try:
@@ -56,7 +57,7 @@ except ImportError:
         """place holder dummy"""
 
 
-from .sensor import SolaXModbusSensor
+from .sensor import SolaXModbusSensor, is_entity_enabled
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ def should_register_be_loaded(hass, hub, descriptor):
     Check if an entity is enabled in the entity registry, checking across multiple platforms. 
     """ 
     if descriptor.internal: 
-        _LOGGER.debug(f"should be loaded: entity with key {descriptor.key} is internal, returning True.")
+        _LOGGER.debug(f"{hub.name}: should be loaded: entity with key {descriptor.key} is internal, returning True.")
         return True
     unique_id     = f"{hub._name}_{descriptor.key}" 
     unique_id_alt = f"{hub._name}.{descriptor.key}" # dont knnow why 
@@ -170,24 +171,24 @@ def should_register_be_loaded(hass, hub, descriptor):
     # First, check if there is an existing enabled entity in the registry for this unique_id. 
     for platform in platforms: 
         entity_id = registry.async_get_entity_id(platform, DOMAIN, unique_id)
-        if entity_id: _LOGGER.debug(f"should be loaded: entity_id for {unique_id} on platform {platform} is now {entity_id}")
+        if entity_id: _LOGGER.debug(f"{hub.name}: should be loaded: entity_id for {unique_id} on platform {platform} is now {entity_id}")
         else: 
             entity_id = registry.async_get_entity_id(platform, DOMAIN, unique_id_alt)
-            _LOGGER.debug(f"should be loaded: entity_id for alt {unique_id_alt} on platform {platform} is now {entity_id}")
+            _LOGGER.debug(f"{hub.name}: should be loaded: entity_id for alt {unique_id_alt} on platform {platform} is now {entity_id}")
         if entity_id:
             entity_found = True
             entity_entry = registry.async_get(entity_id) 
             if entity_entry and not entity_entry.disabled: 
-                _LOGGER.debug(f"should be loaded: Entity {entity_id} is enabled, returning True.")
+                _LOGGER.debug(f"{hub.name}: should be loaded: Entity {entity_id} is enabled, returning True.")
                 return True # Found an enabled entity, no need to check further 
     # If we get here, no enabled entity was found across all platforms.
     if entity_found: 
         # At least one entity exists for this unique_id, but all are disabled. Respect the user's choice. 
-        _LOGGER.debug(f"should be loaded: entity with unique_id {unique_id} was found but is disabled across all relevant platforms.")
+        _LOGGER.debug(f"{hub.name}: should be loaded: entity with unique_id {unique_id} was found but is disabled across all relevant platforms.")
         return False
     else: 
         # No entity exists for this unique_id on any platform. Treat it as a new entity. 
-        _LOGGER.debug(f"should be loaded: entity with unique_id {unique_id} not found in entity registry, checking defaults ")
+        _LOGGER.debug(f"{hub.name}: should be loaded: entity with unique_id {unique_id} not found in entity registry, checking defaults ")
         if descriptor.entity_registry_enabled_default: return True
         # check the other platforms descriptors
         d =  hub.selectEntities.get(descriptor.key) 
@@ -196,7 +197,7 @@ def should_register_be_loaded(hass, hub, descriptor):
         if d and d.entity_registry_enabled_default: return True
         d =  hub.switchEntities.get(descriptor.key)
         if d and d.entity_registry_enabled_default: return True
-        _LOGGER.debug(f"should be loaded: entity_default with unique_id {unique_id} was found but is disabled across all relevant platforms.")
+        _LOGGER.debug(f"{hub.name}: should be loaded: entity_default with unique_id {unique_id} was found but is disabled across all relevant platforms.")
         return False 
 
 
@@ -417,6 +418,14 @@ class SolaXModbusHub:
         self.blocks_changed = False
         self.initial_groups = {} # as returned by the sensor setup - holdingRegs and inputRegs should not change 
 
+        # Bad register handling (startup bisect + deferred recheck)
+        # bad_regs: definitively bad entity base-addresses (per register type)
+        # bad_recheck: candidates found by bisect that must be revalidated later
+        self.bad_regs = {"holding": set(), "input": set()}
+        self.bad_recheck = {"holding": set(), "input": set()}
+        self._did_initial_bisect = False
+        self.bisect_max_depth = 10  # safety cap to avoid pathological recursion
+
         #_LOGGER.debug("solax modbushub done %s", self.__dict__)
 
 
@@ -498,7 +507,7 @@ class SolaXModbusHub:
             if   regtype == REG_HOLDING: g = self.plugin.default_holding_scangroup
             elif regtype == REG_INPUT:   g = self.plugin.default_input_scangroup
             else: 
-                _LOGGER.debug(f"default scan_group for {sensor.entity_description.key} returned {g} - {SCAN_GROUP_DEFAULT}")
+                _LOGGER.debug(f"{self._name}: default scan_group for {sensor.entity_description.key} returned {g} - {SCAN_GROUP_DEFAULT}")
                 g = SCAN_GROUP_DEFAULT # should not occur
 
         if g == SCAN_GROUP_AUTO:
@@ -517,9 +526,9 @@ class SolaXModbusHub:
         g = self.config.get(g, None)
         # when declared but not present in config, use default; this MUST exist
         if g is None:
-            _LOGGER.warning(f"Fast or Medium scan groups do not seem to exist in config: {g} using default {self.config[SCAN_GROUP_DEFAULT]}")
+            _LOGGER.warning(f"{self._name}: Fast or Medium scan groups do not seem to exist in config: {g} using default {self.config[SCAN_GROUP_DEFAULT]}")
             g = self.config[SCAN_GROUP_DEFAULT]
-        else: _LOGGER.debug(f"returning scan_group interval {g} for {sensor.entity_description.key}")
+        else: _LOGGER.debug(f"{self._name}: returning scan_group interval {g} for {sensor.entity_description.key}")
         return g
 
     def device_group_key(self, device_info: DeviceInfo):
@@ -547,13 +556,13 @@ class SolaXModbusHub:
                 await self._check_connection()
                 await self.async_refresh_modbus_data(interval_group, _now)
 
-            _LOGGER.info(f"starting timer loop for interval group: {interval}")
+            _LOGGER.info(f"{self._name}: starting timer loop for interval group: {interval}")
             interval_group.unsub_interval_method = async_track_time_interval(
                 self._hass, _refresh, timedelta(seconds=interval)
             )
         device_key = self.device_group_key(sensor.device_info)
         grp = interval_group.device_groups.setdefault(device_key, empty_hub_device_group_lambda())
-        _LOGGER.debug(f"adding sensor {sensor.entity_description.key} available: {sensor._attr_available} ")
+        _LOGGER.debug(f"{self._name}: adding sensor {sensor.entity_description.key} available: {sensor._attr_available} ")
         grp.sensors.append(sensor)
         self.blocks_changed = True # will force rebuild_blocks to be called
 
@@ -571,7 +580,7 @@ class SolaXModbusHub:
         if grp is None:
             return
 
-        _LOGGER.debug(f"remove sensor {sensor.entity_description.key} remaining:{len(grp.sensors)} ")
+        _LOGGER.debug(f"{self._name}:remove sensor {sensor.entity_description.key} remaining:{len(grp.sensors)} ")
         grp.sensors.remove(sensor)
 
         if not grp.sensors:
@@ -591,7 +600,7 @@ class SolaXModbusHub:
 
     async def async_refresh_modbus_data(self, interval_group, _now: Optional[int] = None) -> None:
         """Time to update."""
-        _LOGGER.debug(f"scan_group timer initiated refresh_modbus_data call - interval {interval_group.interval}")
+        _LOGGER.debug(f"{self._name}: scan_group timer initiated refresh_modbus_data call - interval {interval_group.interval}")
         self.cyclecount = self.cyclecount + 1
         if not interval_group.device_groups:
             return
@@ -601,12 +610,12 @@ class SolaXModbusHub:
             for group in list(interval_group.device_groups.values()): # not sure if this does not break things or affects performance
                 update_result = await self.async_read_modbus_data(group)
                 if update_result:
-                    if self.slowdown > 1: _LOGGER.info(f"communication restored, resuming normal speed after slowdown")
+                    if self.slowdown > 1: _LOGGER.info(f"{self._name}: communication restored, resuming normal speed after slowdown")
                     self.slowdown = 1  # return to full polling after successful cycle
                     for sensor in group.sensors:
                         sensor.modbus_data_updated()
                 else:
-                    if self.slowdown <=1: _LOGGER.info(f"modbus group read failed - assuming sleep mode - slowing down by factor 10" )
+                    if self.slowdown <=1: _LOGGER.info(f"{self._name}: modbus group read failed - assuming sleep mode - slowing down by factor 10" )
                     self.slowdown = 10
                     for i in self.sleepnone:
                         self.data.pop(i, None)
@@ -614,7 +623,7 @@ class SolaXModbusHub:
                         self.data[i] = 0
                     # self.data = {} # invalidate data - do we want this ??
 
-                _LOGGER.debug(f"device group read done")
+                _LOGGER.debug(f"{self._name}: device group read done")
 
     @property
     def invertertype(self):
@@ -841,8 +850,8 @@ class SolaXModbusHub:
     def treat_address(self, data, decoder, descr, initval=0):
         return_value = None
         val = None
-        if self.cyclecount < 5:
-            _LOGGER.debug(f"treating register 0x{descr.register:02x} : {descr.key}")
+        if self.cyclecount < VERBOSE_CYCLES:
+            _LOGGER.debug(f"{self._name}: treating register 0x{descr.register:02x} : {descr.key}")
         try:
             if descr.unit == REGISTER_U16:
                 val = decoder.decode_16bit_uint()
@@ -865,16 +874,16 @@ class SolaXModbusHub:
             elif descr.unit == REGISTER_U8H:
                 val = initval >> 8
             else:
-                _LOGGER.warning(f"undefinded unit for entity {descr.key} - setting value to zero")
+                _LOGGER.warning(f"{self._name}: undefinded unit for entity {descr.key} - setting value to zero")
                 val = 0
         except Exception as ex:
-            if self.cyclecount < 5:
+            if self.cyclecount < VERBOSE_CYCLES:
                 _LOGGER.warning(
-                    f"{self.name}: read failed at 0x{descr.register:02x}: {descr.key}",
+                    f"{self._name}: read failed at 0x{descr.register:02x}: {descr.key}",
                     exc_info=True,
                 )
             else:
-                _LOGGER.warning(f"{self.name}: read failed at 0x{descr.register:02x}: {descr.key} ")
+                _LOGGER.warning(f"{self._name}: read failed at 0x{descr.register:02x}: {descr.key} ")
         """ TO BE REMOVED
         if descr.prevent_update:
             if  (self.tmpdata_expiry.get(descr.key, 0) > time()):
@@ -933,9 +942,9 @@ class SolaXModbusHub:
 
     async def async_read_modbus_block(self, data, block, typ):
         errmsg = None
-        if self.cyclecount < 5:
+        if self.cyclecount < VERBOSE_CYCLES:
             _LOGGER.debug(
-                f"{self.name} modbus {typ} block start: 0x{block.start:x} end: 0x{block.end:x}  len: {block.end - block.start} \nregs: {block.regs}"
+                f"{self._name}: modbus {typ} block start: 0x{block.start:x} end: 0x{block.end:x}  len: {block.end - block.start} \nregs: {block.regs}"
             )
         try:
             if typ == "input":
@@ -952,7 +961,7 @@ class SolaXModbusHub:
                 )
         except Exception as ex:
             errmsg = f"exception {str(ex)} "
-            _LOGGER.debug(f"exception reading {typ} {block.start} {errmsg}")
+            _LOGGER.debug(f"{self._name}: exception reading {typ} {block.start} {errmsg}")
         else:
             if realtime_data is None or realtime_data.isError():
                 errmsg = f"read_error "
@@ -971,7 +980,7 @@ class SolaXModbusHub:
             for reg in block.regs:
                 if (reg - prevreg) > 0:
                     decoder.skip_bytes((reg - prevreg) * 2)
-                    if self.cyclecount < 5:
+                    if self.cyclecount < VERBOSE_CYCLES:
                         _LOGGER.debug(f"skipping bytes {(reg-prevreg) * 2}")
                 descr = block.descriptions[reg]
                 if type(descr) is dict:  #  set of byte values
@@ -998,9 +1007,9 @@ class SolaXModbusHub:
             return True
         else:  # block read failure
             firstdescr = block.descriptions[block.start]  # check only first item in block
-            _LOGGER.debug(f"failed {typ} block {errmsg} start {block.start} {firstdescr.key} ignore_readerror: {firstdescr.ignore_readerror}")
+            _LOGGER.debug(f"{self._name}: failed {typ} block {errmsg} start 0x{block.start:x} {firstdescr.key} ignore_readerror: {firstdescr.ignore_readerror}")
             if (firstdescr.ignore_readerror is not False):  # ignore block read errors and return static data
-                _LOGGER.debug(f"failed block analysis started firstignore: {firstdescr.ignore_readerror}")
+                _LOGGER.debug(f"{self._name}: failed block analysis started firstignore: {firstdescr.ignore_readerror}")
                 for reg in block.regs:
                     descr = block.descriptions[reg]
                     if   type(descr) is dict: l = descr.items() # special case: mutliple U8x entities
@@ -1009,18 +1018,18 @@ class SolaXModbusHub:
                         d_ignore = descr.ignore_readerror
                         d_key = descr.key
                         if (d_ignore is not True) and (d_ignore is not False):
-                            _LOGGER.debug(f"returning static {d_key} = {d_ignore}")
+                            _LOGGER.debug(f"{self._name}: returning static {d_key} = {d_ignore}")
                             data[d_key] = d_ignore  # return something static
                         else:
                             if d_ignore is False: # remove potentially faulty data
                                 popped = data.pop(d_key, None) # added 20250716
-                                _LOGGER.debug(f"popping {d_key} = {popped}")
-                            else: _LOGGER.debug(f"not touching {d_key} ")
+                                _LOGGER.debug(f"{self._name}: popping {d_key} = {popped}")
+                            else: _LOGGER.debug(f"{self._name}: not touching {d_key} ")
                 return True
             else: # dont ignore readerrors
                 if self.slowdown == 1:
                     _LOGGER.info(
-                        f"{errmsg}: {self.name} cannot read {typ} registers at device {self._modbus_addr} position 0x{block.start:x}",
+                        f"{self._name} : {errmsg}: cannot read {typ} registers at device {self._modbus_addr} position 0x{block.start:x}",
                         exc_info=True,
                     )
                 return False
@@ -1028,20 +1037,22 @@ class SolaXModbusHub:
     async def async_read_modbus_registers_all(self, group):
         if group.readPreparation is not None:
             if not await group.readPreparation(self.data):
-                _LOGGER.info(f"device group read cancel")
+                _LOGGER.info(f"{self._name}: device group read cancel")
                 return True
         else:
-            _LOGGER.debug(f"device group inverter")
+            _LOGGER.debug(f"{self._name}: device group inverter")
 
         #data = {"_repeatUntil": self.data["_repeatUntil"]} # remove for issue #1440 but then does not recognize comm errors
         data = self.data # is an alias, not a copy (issue #1440)
         res = True
         for block in group.holdingBlocks:
-            _LOGGER.debug(f"** trying to read holding block {block.start} {res}")
+            _LOGGER.debug(f"{self._name}: ** trying to read holding block 0x{block.start:x} {res}")
             res = res and await self.async_read_modbus_block(data, block, "holding")
+            _LOGGER.debug(f"{self._name}: holding block 0x{block.start:x} read done {res}")
         for block in group.inputBlocks:
-            _LOGGER.debug(f"** trying to read input block {block.start} {res}")
+            _LOGGER.debug(f"{self._name}: ** trying to read input block 0x{block.start:x} {res}")
             res = res and await self.async_read_modbus_block(data, block, "input")
+            _LOGGER.debug(f"{self._name}: input block 0x{block.start:x} read done {res}")
 
         if self.localsUpdated:
             await self._hass.async_add_executor_job(self.saveLocalData)
@@ -1052,8 +1063,8 @@ class SolaXModbusHub:
             # Do NOT call modbus_data_updated() from here Race Condition:it calls hub.rebuild_blocks() before async_add_entities is called.
             data[key] = descr.value_function(0, descr, data)
             sens = self.sensorEntities[key]
-            #_LOGGER.debug(f"quickly updating state for computed sensor {sens} {key} {data[descr.key]} ")
-            if sens and not descr.internal: sens.modbus_data_updated() # publish state to GUI and automations faster
+            _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {data[descr.key]} ")
+            if sens and is_entity_enabled(self._hass, self, descr) and not descr.internal: sens.modbus_data_updated() # publish state to GUI and automations faster
 
         if group.readFollowUp is not None:
             if not await group.readFollowUp(self.data, data):
@@ -1130,7 +1141,7 @@ class SolaXModbusHub:
 
 # --------------------------------------------- Sorting and grouping of entities -----------------------------------------------
 
-    def splitInBlocks( self, descriptions):
+    def splitInBlocks(self, descriptions):
         start = INVALID_START
         end = 0
         blocks = []
@@ -1139,19 +1150,19 @@ class SolaXModbusHub:
         curblockregs = []
         for reg, descr in descriptions.items():
             d_ignore_readerror = auto_block_ignore_readerror
-            if type(descr) is dict: # 2 byte  REGISTER_U8L, _U8H values on same modbus 16 bit address
+            if type(descr) is dict:  # 2 byte  REGISTER_U8L, _U8H values on same modbus 16 bit address
                 d_newblock = False
                 d_enabled = False
                 for sub, d in descr.items():
                     #d_newblock = d_newblock or d.newblock # ok, if needed, put a newblock on all subentries
-                    if should_register_be_loaded(self._hass, self, d): # *** CHANGED LINE: logic delegated to new function
+                    if should_register_be_loaded(self._hass, self, d):
                         d_enabled = True
-                        break 
+                        break
                     d_unit = d.unit
                     d_wordcount = 1 # not used here
                     d_key = d.key # does not matter which key we use here
                     d_regtype = d.register_type
-            else: # normal entity
+            else:  # normal entity
                 # 1. First, check if the entity itself should be loaded based on its own state or defaults.
                 d_enabled = should_register_be_loaded(self._hass, self, descr)
 
@@ -1159,7 +1170,7 @@ class SolaXModbusHub:
                 if not d_enabled:
                     if self._is_dependency_for_enabled_control(descr.key):
                         d_enabled = True
-                        _LOGGER.debug(f"Forcing poll for disabled sensor '{descr.key}' as it's a needed dependency.")
+                        _LOGGER.debug(f"{self._name}:Forcing poll for disabled sensor '{descr.key}' as it's a needed dependency.")
 
                 d_newblock = descr.newblock
                 d_unit = descr.unit
@@ -1170,50 +1181,68 @@ class SolaXModbusHub:
             if d_enabled:
                 if (d_newblock or ((reg - start) > block_size)):
                     if ((end - start) > 0):
-                        _LOGGER.debug(f"Starting new block at 0x{reg:x} ")
+                        _LOGGER.debug(f"{self._name}: Starting new block at 0x{reg:x} ")
                         if  ( (auto_block_ignore_readerror is True) or (auto_block_ignore_readerror is False) ) and not d_newblock: # automatically created block
-                            if type(descr) is dict: 
+                            if type(descr) is dict:
                                 for sub, d in descr.items():
-                                    if d.ignore_readerror is False: d.ignore_readerror = auto_block_ignore_readerror
-                            else: 
-                                if descr.ignore_readerror is False: descr.ignore_readerror = auto_block_ignore_readerror
-                        #newblock = block(start = start, end = end, order16 = descriptions[start].order16, order32 = descriptions[start].order32, descriptions = descriptions, regs = curblockregs)
-                        newblock = block(start = start, end = end, descriptions = descriptions, regs = curblockregs)
+                                    if d.ignore_readerror is False:
+                                        d.ignore_readerror = auto_block_ignore_readerror
+                                        d_ignore_readerror = d_ignore_readerror or d.ignore_readerror
+                            else:
+                                if descr.ignore_readerror is False:
+                                    descr.ignore_readerror = auto_block_ignore_readerror
+                                    d_ignore_readerror = descr.ignore_readerror
+                        newblock = block(start=start, end=end, descriptions=descriptions, regs=curblockregs)
                         blocks.append(newblock)
                         start = INVALID_START
                         end = 0
                         curblockregs = []
-                    else: _LOGGER.debug(f"newblock declaration found for empty block")
+                    else:
+                        _LOGGER.debug(f"{self._name}: newblock declaration found for empty block")
 
-                if start == INVALID_START: start = reg
+                if start == INVALID_START:
+                    start = reg
 
-                _LOGGER.debug(f"adding register 0x{reg:x} {d_key} to block with start 0x{start:x}")
+                # Skip definitively bad entity bases and split blocks at bad boundaries
+                typ_key = "holding" if d_regtype == REG_HOLDING else "input"
+                if reg in self.bad_regs[typ_key]:
+                    # Close current block if it already has content
+                    if ((end - start) > 0):
+                        newblock = block(start=start, end=end, descriptions=descriptions, regs=curblockregs)
+                        blocks.append(newblock)
+                    # Reset for next block after the bad address
+                    start = INVALID_START
+                    end = 0
+                    curblockregs = []
+                    _LOGGER.debug(f"{self._name}: skipping bad {typ_key} register 0x{reg:x}")
+                    continue
+
+                _LOGGER.debug(f"{self._name}: adding register 0x{reg:x} {d_key} to block with start 0x{start:x} ignore_readerror:{d_ignore_readerror}")
                 if d_unit in (REGISTER_STR, REGISTER_WORDS,):
-                    if (d_wordcount): end = reg+d_wordcount
-                    else: _LOGGER.warning(f"invalid or missing missing wordcount for {d_key}")
-                elif d_unit in (REGISTER_S32, REGISTER_U32, REGISTER_ULSB16MSB16,):  end = reg + 2
-                else: end = reg + 1
-                _LOGGER.debug(f"adding type {d_regtype} register 0x{reg:x} {d_key} to block with start 0x{start:x}")
+                    if (d_wordcount):
+                        end = reg + d_wordcount
+                    else:
+                        _LOGGER.warning(f"{self._name}: invalid or missing missing wordcount for {d_key}")
+                elif d_unit in (REGISTER_S32, REGISTER_U32, REGISTER_ULSB16MSB16,):
+                    end = reg + 2
+                else:
+                    end = reg + 1
+                _LOGGER.debug(f"{self._name}: adding type {d_regtype} register 0x{reg:x} {d_key} to block with start 0x{start:x}")
                 curblockregs.append(reg)
             else:
-                _LOGGER.debug(f"ignoring type {d_regtype} register 0x{reg:x} {d_key} to block with start 0x{start:x}")
+                _LOGGER.debug(f"{self._name}: ignoring type {d_regtype} register 0x{reg:x} {d_key} to block with start 0x{start:x}")
 
-
-        if ((end-start)>0): # close last block
-            #newblock = block(start = start, end = end, order16 = descriptions[start].order16, order32 = descriptions[start].order32, descriptions = descriptions, regs = curblockregs)
-            newblock = block(start = start, end = end, descriptions = descriptions, regs = curblockregs)
+        if ((end - start) > 0):  # close last block
+            newblock = block(start=start, end=end, descriptions=descriptions, regs=curblockregs)
             blocks.append(newblock)
-        # Remove empty blocks before returning the blocks. - is this needed ??
-        #before = len(blocks)
-        #blocks = [b for b in blocks if b.regs] # needed ??
         return blocks
 
     def rebuild_blocks(self, initial_groups): #, computedRegs):
-        _LOGGER.info(f"rebuilding groups and blocks - pre: {initial_groups.keys()}")
+        _LOGGER.info(f"{self._name}: rebuilding groups and blocks - pre: {initial_groups.keys()}")
         self.initial_groups = initial_groups
         for interval, interval_group in initial_groups.items():
             for device_name, device_group in interval_group.device_groups.items():
-                _LOGGER.info(f"rebuild for device {device_name} in interval {interval}")
+                _LOGGER.info(f"{self._name}: rebuild for device {device_name} in interval {interval}")
                 holdingRegs = dict(sorted(device_group.holdingRegs.items()))
                 inputRegs   = dict(sorted(device_group.inputRegs.items()))
                 # update the hub groups
@@ -1229,7 +1258,185 @@ class SolaXModbusHub:
                 #_LOGGER.debug(f"holdingBlocks: {hub_device_group.holdingBlocks}")
                 #_LOGGER.debug(f"inputBlocks: {hub_device_group.inputBlocks}")
         self.blocks_changed = False
-        _LOGGER.info(f"done rebuilding groups and blocks - post: {self.initial_groups.keys()}")
+        _LOGGER.info(f"{self._name}: done rebuilding groups and blocks - post: {self.initial_groups.keys()}")
+
+        # Trigger a single initial bisect run (non-blocking) after the very first build
+        if not self._did_initial_bisect:
+            self._did_initial_bisect = True
+            # run in background to avoid delaying the polling loop
+            self._hass.loop.create_task(self._run_initial_bisect_for_all_groups())
+
+
+    async def _run_initial_bisect_for_all_groups(self):
+        """Run a one-time bisect over all current blocks to discover unreadable entity bases.
+        The result updates self.bad_recheck and schedules a delayed revalidation.
+        """
+        # If not online, postpone once to avoid mislabeling during startup flaps
+        if not await self.is_online():
+            _LOGGER.info(f"{self._name}: initial bisect postponed (offline)")
+            await asyncio.sleep(5)
+            if not await self.is_online():
+                _LOGGER.info(f"{self._name}: initial bisect skipped (still offline)")
+                return
+
+        # Walk through all currently built groups/blocks
+        for interval_group in self.groups.values():
+            for dev_group in interval_group.device_groups.values():
+                for blk in getattr(dev_group, "holdingBlocks", []):
+                    await self._initial_bisect_block(blk, "holding")
+                for blk in getattr(dev_group, "inputBlocks", []):
+                    await self._initial_bisect_block(blk, "input")
+
+        # If no suspects were identified by the initial bisect, log that explicitly
+        if not (self.bad_recheck["holding"] or self.bad_recheck["input"]):
+            _LOGGER.debug(f"{self._name}: initial bisect found no suspect registers.")
+
+        # Re-validate candidates after a short grace period
+        self._hass.loop.create_task(self._recheck_bad_after(30))
+
+    async def _initial_bisect_block(self, block_obj, typ):
+        """Bisect a block once at startup. Operates on *entity bases* only, so multi-register
+        entities (U32/STR/WORDS) are never split apart. No value decoding happens here."""
+        try:
+            await self._read_block_with_bisect_once(block_obj, typ)
+        except Exception as ex:
+            _LOGGER.debug(f"{self._name}: exception during initial bisect ({typ}) 0x{block_obj.start:x}-0x{block_obj.end:x}: {ex}")
+
+    async def _read_block_with_bisect_once(self, block_obj, typ, depth=0):
+        """Attempt a raw bulk read for the block. If it fails and we are online, split the entity-base
+        list into halves and probe recursively until single-entity blocks are found.
+        Single-entity failures are added to bad_recheck (not yet definitive)."""
+        if await self._probe_block(block_obj, typ):
+            return True
+
+        # Avoid false positives when transport is down / slowed
+        if not await self.is_online():
+            return False
+
+        regs = block_obj.regs or []
+        if depth >= self.bisect_max_depth or len(regs) <= 1:
+            if len(regs) == 1:
+                addr = regs[0]
+                self.bad_recheck[typ].add(addr)
+                _LOGGER.debug(f"{self._name}: candidate bad {typ} entity base 0x{addr:x}")
+            return True
+
+        # Split entity-base list (keeps multi-register entities intact)
+        mid = len(regs) // 2
+        left = self._subblock_entity_span(block_obj, 0, mid)
+        right = self._subblock_entity_span(block_obj, mid, len(regs))
+
+        await self._read_block_with_bisect_once(left, typ, depth + 1)
+        await self._read_block_with_bisect_once(right, typ, depth + 1)
+        return True
+
+    def _entity_span_end(self, desc_map, base_reg):
+        """Compute end address (exclusive) for a single entity starting at base_reg based on its unit.
+        This ensures we never split STR/WORDS or 32-bit entities."""
+        descr = desc_map.get(base_reg)
+        if descr is None:
+            return base_reg + 1
+        # If the descriptor is a dict of byte-split entities (U8H/U8L), they share the same 16-bit reg
+        if isinstance(descr, dict):
+            return base_reg + 1
+        unit = getattr(descr, "unit", None)
+        if unit in (REGISTER_S32, REGISTER_U32, REGISTER_F32, REGISTER_ULSB16MSB16):
+            return base_reg + 2
+        if unit in (REGISTER_STR, REGISTER_WORDS):
+            wc = getattr(descr, "wordcount", 1) or 1
+            return base_reg + wc
+        return base_reg + 1
+
+    def _subblock_entity_span(self, block_obj, i0, i1):
+        """Create a sub-block using entity-base indices [i0, i1), computing a correct exclusive end
+        based on the last entity's span. This preserves multi-register entities on reads."""
+        regs = block_obj.regs[i0:i1]
+        # start is the first entity base
+        start = regs[0]
+        # end must honor the last entity's full span
+        last_base = regs[-1]
+        end = self._entity_span_end(block_obj.descriptions, last_base)
+        return block(start=start, end=end, descriptions=block_obj.descriptions, regs=regs)
+
+    async def _probe_block(self, block_obj, typ):
+        """Transport-level probe: perform a raw modbus read for [start, end) without decoding.
+        Returns True if the read returns a non-error response; False on error/timeout."""
+        count = max(0, block_obj.end - block_obj.start)
+        if count <= 0:
+            return True
+        try:
+            if typ == "input":
+                resp = await self.async_read_input_registers(
+                    unit=self._modbus_addr, address=block_obj.start, count=count
+                )
+            else:
+                resp = await self.async_read_holding_registers(
+                    unit=self._modbus_addr, address=block_obj.start, count=count
+                )
+            if resp is None:
+                return False
+            is_err = getattr(resp, "isError", lambda: False)()
+            return not is_err
+        except Exception as ex:
+            _LOGGER.debug(f"{self._name}: probe {typ} 0x{block_obj.start:x}-0x{block_obj.end:x} failed: {ex}")
+            return False
+
+    async def _recheck_bad_after(self, seconds):
+        """After a grace period, re-validate all candidate bad entity bases. Only reproducible
+        failures are promoted to definitive bad_regs; otherwise the candidate is dropped."""
+        await asyncio.sleep(seconds)
+        confirmed_any = False
+        for typ in ("holding", "input"):
+            candidates = list(self.bad_recheck[typ])
+            for addr in candidates:
+                ok = False
+                # Probe exactly the entity span for this base address (size-aware)
+                # Build a minimal block for this single entity
+                # We need a description map; if not available here, probe just 1 reg as a fallback
+                try:
+                    desc_map = None
+                    # Try to find any currently built block that contains this base to derive size
+                    for interval_group in self.groups.values():
+                        for dev_group in interval_group.device_groups.values():
+                            blocks = getattr(dev_group, "holdingBlocks", []) if typ == "holding" else getattr(dev_group, "inputBlocks", [])
+                            for blk in blocks:
+                                if addr in (blk.regs or []):
+                                    desc_map = blk.descriptions
+                                    break
+                            if desc_map is not None:
+                                break
+                        if desc_map is not None:
+                            break
+                    if desc_map is not None:
+                        end = self._entity_span_end(desc_map, addr)
+                    else:
+                        end = addr + 1
+                    single = block(start=addr, end=end, descriptions=None, regs=[addr])
+                except Exception:
+                    single = block(start=addr, end=addr + 1, descriptions=None, regs=[addr])
+
+                # Try a few times in quick succession to avoid transient network spikes
+                for _ in range(3):
+                    if await self.is_online() and await self._probe_block(single, typ):
+                        ok = True
+                        break
+                    await asyncio.sleep(0.05)
+
+                if ok:
+                    self.bad_recheck[typ].discard(addr)
+                    _LOGGER.info(f"{self._name}: entity base 0x{addr:x} ({typ}) recovered on recheck")
+                else:
+                    self.bad_regs[typ].add(addr)
+                    self.bad_recheck[typ].discard(addr)
+                    confirmed_any = True
+                    _LOGGER.warning(f"{self._name}: confirmed bad {typ} entity base 0x{addr:x}")
+
+        if confirmed_any:
+            # Force blocks to be rebuilt so future bulk reads exclude confirmed-bad bases
+            self.blocks_changed = True
+        else:
+            # No candidates remained bad on recheck; make that visible in logs
+            _LOGGER.debug(f"{self._name}: no bad registers confirmed on recheck.")
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 
