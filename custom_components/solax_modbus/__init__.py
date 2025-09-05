@@ -415,6 +415,7 @@ class SolaXModbusHub:
         self.bad_recheck = {"holding": set(), "input": set()}
         self._did_initial_bisect = False
         self.bisect_max_depth = 10  # safety cap to avoid pathological recursion
+        self._bisected_spans = set()  # (typ, tuple(regs)) signatures already bisected
 
         # Gate normal polling until initial probe completes
         self._probe_ready = asyncio.Event()
@@ -1012,7 +1013,111 @@ class SolaXModbusHub:
                         f"{self._name} : {errmsg}: cannot read {typ} registers at device {self._modbus_addr} position 0x{block.start:x}",
                         exc_info=True,
                     )
+                    # On-demand refinement: try to bisect only this failing block and replace it with sub-blocks excluding bad bases
+                    try:
+                        refined = await self._refine_failed_block(block, typ)
+                        if refined:
+                            _LOGGER.info(f"{self._name}: refined failing {typ} block 0x{block.start:x}-0x{block.end:x}; continuing")
+                            return True
+                    except Exception as ex:
+                        _LOGGER.debug(f"{self._name}: refine failed for {typ} 0x{block.start:x}-0x{block.end:x}: {ex}")
                 return False
+
+    async def _refine_failed_block(self, block_obj, typ) -> bool:
+        """On-demand refine a failing block: use the existing bisect to identify bad bases within this block,
+        then replace the block in-place with sub-blocks that exclude those bases. Returns True if replacement occurred."""
+        # Do nothing if offline/slowdown (avoid mislabeling transport issues)
+        if not await self.is_online():
+            _LOGGER.info(f"{self._name}: refine skipped (offline/slowdown)")
+            return False
+        regs_list = block_obj.regs or []
+        if not regs_list:
+            return False
+        before = set(self.bad_recheck.get(typ, set()))
+        try:
+            await self._read_block_with_bisect_once(block_obj, typ)
+        except Exception as ex:
+            _LOGGER.debug(f"{self._name}: refine bisect exception {ex}")
+        after = set(self.bad_recheck.get(typ, set()))
+        # Only consider candidates within this block
+        new_candidates = [a for a in (after - before) if a in regs_list]
+        if not new_candidates:
+            # Size-only refinement: if the large span fails but smaller spans succeed, use them.
+            _LOGGER.info(f"{self._name}: no candidates found for failing {typ} block 0x{block_obj.start:x}-0x{block_obj.end:x} – applying size-only refinement")
+            ok_blocks = await self._refine_blocks_by_size_only(block_obj, typ)
+            if ok_blocks:
+                await self._replace_block_in_device_group(block_obj, typ, ok_blocks)
+                self.blocks_changed = True
+                return True
+            return False
+        # Build sub-blocks omitting bad bases
+        good_regs = [r for r in regs_list if r not in set(new_candidates)]
+        subblocks = self._make_subblocks_from_entity_list(block_obj.descriptions, good_regs)
+        await self._replace_block_in_device_group(block_obj, typ, subblocks)
+        # mark that blocks have changed (so a later rebuild will permanently exclude after recheck)
+        self.blocks_changed = True
+        return True
+
+    async def _refine_blocks_by_size_only(self, block_obj, typ):
+        """Recursively split a failing block into smaller sub-blocks that probe OK.
+        Returns a list of OK sub-blocks (may be empty if nothing succeeds)."""
+        # If the whole block probes OK, just return it
+        if await self._probe_block(block_obj, typ):
+            return [block_obj]
+        regs = block_obj.regs or []
+        if len(regs) <= 1:
+            # cannot split further; single-base span still failing → give up here (bad-base path may handle later)
+            return []
+        mid = len(regs) // 2
+        left = self._subblock_entity_span(block_obj, 0, mid)
+        right = self._subblock_entity_span(block_obj, mid, len(regs))
+        ok = []
+        # Recurse; gather only those that succeed
+        left_ok = await self._refine_blocks_by_size_only(left, typ)
+        right_ok = await self._refine_blocks_by_size_only(right, typ)
+        ok.extend(left_ok)
+        ok.extend(right_ok)
+        # Optionally, coalesce adjacent runs that directly touch (keep simple here; block maker can coalesce later)
+        return ok
+
+    def _make_subblocks_from_entity_list(self, desc_map, regs):
+        """Pack a sorted list of good entity bases into minimal contiguous sub-blocks."""
+        sub = []
+        if not regs:
+            return sub
+        regs = list(regs)
+        run = [regs[0]]
+        def span_end(base):
+            return self._entity_span_end(desc_map, base)
+        for prev, cur in zip(regs, regs[1:]):
+            if cur == span_end(prev):
+                run.append(cur)
+            else:
+                start = run[0]
+                end = span_end(run[-1])
+                sub.append(block(start=start, end=end, descriptions=desc_map, regs=list(run)))
+                run = [cur]
+        # last run
+        start = run[0]
+        end = span_end(run[-1])
+        sub.append(block(start=start, end=end, descriptions=desc_map, regs=list(run)))
+        return sub
+
+    async def _replace_block_in_device_group(self, old_block, typ, new_blocks):
+        """Replace a block in the current device_group lists with refined sub-blocks."""
+        for interval_group in self.groups.values():
+            for dev_group in interval_group.device_groups.values():
+                lst = dev_group.holdingBlocks if typ == "holding" else dev_group.inputBlocks
+                try:
+                    idx = lst.index(old_block)
+                except ValueError:
+                    continue
+                # Replace
+                lst.pop(idx)
+                for nb in reversed(new_blocks):
+                    lst.insert(idx, nb)
+                _LOGGER.info(f"{self._name}: replaced {typ} block 0x{old_block.start:x}-0x{old_block.end:x} with {len(new_blocks)} refined sub-blocks")
+                return
 
     async def async_read_modbus_registers_all(self, group):
         if group.readPreparation is not None:
@@ -1246,14 +1351,12 @@ class SolaXModbusHub:
         self.blocks_changed = False
         _LOGGER.info(f"{self._name}: done rebuilding groups and blocks - post: {self.initial_groups.keys()}")
 
-
-        # Trigger a single initial bisect run (non-blocking) after the very first build
-        if not self._did_initial_bisect:
-            self._did_initial_bisect = True
-            # hold off normal polling until probe finishes
-            self._probe_ready.clear()
-            # run in background to avoid delaying the event loop
+        # Incremental bisect: on first build run full; thereafter only new spans
+        self._probe_ready.clear()
+        if not self._bisected_spans:
             self._hass.loop.create_task(self._run_initial_bisect_for_all_groups())
+        else:
+            self._hass.loop.create_task(self._bisect_new_blocks_once())
 
 
     async def _run_initial_bisect_for_all_groups(self):
@@ -1281,11 +1384,43 @@ class SolaXModbusHub:
         if not (self.bad_recheck["holding"] or self.bad_recheck["input"]):
             _LOGGER.info(f"{self._name}: initial bisect found no suspect registers.")
 
+        # Record all spans we just walked
+        for interval_group in self.groups.values():
+            for dev_group in interval_group.device_groups.values():
+                for blk in getattr(dev_group, "holdingBlocks", []):
+                    self._bisected_spans.add(("holding", tuple(blk.regs or [])))
+                for blk in getattr(dev_group, "inputBlocks", []):
+                    self._bisected_spans.add(("input", tuple(blk.regs or [])))
         # Probing completed – enable polling
         self._probe_ready.set()
 
         # Re-validate candidates after a short grace period
         self._hass.loop.create_task(self._recheck_bad_after(30))
+
+
+    async def _bisect_new_blocks_once(self):
+        """Bisect only blocks we have not bisected before (by (typ, tuple(regs))).
+        Normal polling is paused via _probe_ready until this finishes.
+        """
+        try:
+            # If not online, do a short postpone to avoid mislabeling
+            if not await self.is_online():
+                _LOGGER.info(f"{self._name}: incremental bisect postponed (offline)")
+                await asyncio.sleep(2)
+            for interval_group in self.groups.values():
+                for dev_group in interval_group.device_groups.values():
+                    for blk in getattr(dev_group, "holdingBlocks", []):
+                        key = ("holding", tuple(blk.regs or []))
+                        if key not in self._bisected_spans:
+                            await self._initial_bisect_block(blk, "holding")
+                            self._bisected_spans.add(key)
+                    for blk in getattr(dev_group, "inputBlocks", []):
+                        key = ("input", tuple(blk.regs or []))
+                        if key not in self._bisected_spans:
+                            await self._initial_bisect_block(blk, "input")
+                            self._bisected_spans.add(key)
+        finally:
+            self._probe_ready.set()
 
     async def _initial_bisect_block(self, block_obj, typ):
         """Bisect a block once at startup. Operates on *entity bases* only, so multi-register
@@ -1307,7 +1442,7 @@ class SolaXModbusHub:
             _LOGGER.info(f"{self._name}: assuming offline during bisect")
             return False
             
-        _LOGGER.info(f"{self._name}: probe not fully ok: depth {depth}/{self.bisect_max_depth} len: {len(block_obj.regs) or []}")
+        _LOGGER.info(f"{self._name}: probe not fully ok: depth {depth}/{self.bisect_max_depth} len: {len(block_obj.regs) if block_obj.regs else 0}")
         regs = block_obj.regs or []
         if depth >= self.bisect_max_depth or len(regs) <= 1:
             if len(regs) == 1:
