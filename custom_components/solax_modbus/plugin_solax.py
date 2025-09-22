@@ -251,30 +251,38 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
         pvlimit = 0 
         pushmode_power = houseload - import_limit
     elif power_control == "Feed-in/Battery Balance":
-        # Surplus case: send PV to the grid first (up to export_limit), then charge the battery with the remainder
-        # Deficit case: discharge the battery first (down to min_discharge_soc), then import the remaining deficit from the grid
+        # --- Feed-in/Battery Balance Mode Explanation ---
+        # This mode dynamically splits PV surplus between grid export (feed-in) and battery charging,
+        # based on a user-configurable factor (0-100%). The goal is to balance how much PV power
+        # goes to the grid versus the battery:
+        #   - Factor 0%: all surplus to grid (maximize feed-in)
+        #   - Factor 100%: all surplus to battery (maximize battery charging)
+        #   - Intermediate values: split between grid and battery
+        # In deficit (house load > PV), battery is discharged to cover the deficit (up to min_discharge_soc).
+
         DEADBAND_W = 100     # deadband around zero net flow to avoid oscillation
         MAX_STEP_W = 2000    # maximum change per loop step unless import limit is exceeded
 
         pv        = datadict.get("pv_power_total", 0)
         houseload = value_function_house_load(initval, descr, datadict)
 
-        # Apply readscale (e.g., Gen4 often uses 10x). If the Number/Sensor already applied readscale,
-        # this heuristic avoids double-scaling by only multiplying when the raw value looks like "hundreds" of watts.
+        # --- Export Limit and Readscale Handling ---
+        # The export limit (max grid feed-in) may be reported in scaled units (e.g., Gen4 uses 10x scaling).
+        # To avoid misinterpreting the limit, we use a heuristic:
+        #   - If the raw value is small (<1000) and a readscale > 1 is set, multiply to get real watts.
+        #   - Otherwise, use the raw value.
+        # This ensures the export limit is correctly interpreted regardless of hardware scaling quirks.
         export_limit_raw = datadict.get("export_control_user_limit", 30000)
         readscale_cfg = datadict.get("config_export_control_limit_readscale", 1)
         try:
             readscale = float(readscale_cfg) if readscale_cfg is not None else 1.0
         except Exception:
             readscale = 1.0
-
-        # Heuristic: if readscale>1 and raw limit is small (<1000), treat it as scaled units and multiply.
         if readscale > 1.0 and isinstance(export_limit_raw, (int, float)) and export_limit_raw < 1000:
             export_limit_eff = int(export_limit_raw * readscale)
         else:
             export_limit_eff = int(export_limit_raw)
-
-        # clamp to sane range and log both raw and effective values
+        # Clamp to a sane range and log both raw and effective values
         export_limit  = max(0, min(60000, export_limit_eff))
         import_limit  = datadict.get("remotecontrol_import_limit", 20000)
         _LOGGER.info(
@@ -288,7 +296,7 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
         pvlimit = max(0, datadict.get("remotecontrol_pv_power_limit", 30000))
 
         last_push = datadict.get("_mode8_last_push", 0)
-        pushmode_power = 0  # positive = discharge, negative = charge
+        pushmode_power = 0  # positive = discharge, negative = charge (see sign convention below)
 
         _LOGGER.info(
             f"[Mode8 Feed-in] inputs pv={pv}W hl={houseload}W exp_lim={export_limit}W imp_lim={import_limit}W "
@@ -299,7 +307,6 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
         measured_power = datadict.get("measured_power", None)           # sign depends on meter (export/import)
         grid_export_s = datadict.get("grid_export", None)               # our computed sensor, if present
         grid_import_s = datadict.get("grid_import", None)
-
         _LOGGER.info(
             "[Mode8 Feed-in] probes: "
             f"measured_power={measured_power if measured_power is not None else 'n/a'} "
@@ -307,21 +314,23 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
             f"grid_import={grid_import_s if grid_import_s is not None else 'n/a'}"
         )
 
+        # --- Surplus: Split PV between grid and battery based on factor ---
+        # If PV >= house load, we have a surplus to split.
         if pv >= houseload:
             surplus = pv - houseload
-            export_base = min(export_limit, surplus)  # what WR would export at most
-
+            # Export as much as possible up to the export limit and available surplus
+            export_base = min(export_limit, surplus)
             # Factor 0..1 from UI (%): 0% => full feed-in, 100% => max battery charge
             factor_pct = datadict.get("feedin_battery_balance", 100)
             try:
                 f = max(0.0, min(1.0, float(factor_pct) / 100.0))
             except Exception:
                 f = 1.0
-
-            # Target export according to factor split
+            # Target export is reduced as factor increases (more to battery)
             export_target = int((1.0 - f) * export_base)
-
-            # Estimate BMS charging capability (A*V) if available; fallback to Register-based cap
+            # --- BMS Capability Check ---
+            # Estimate maximum battery charging capability (W) from BMS if available,
+            # otherwise use a register-based fallback.
             bms_a = datadict.get("bms_charge_max_current", None)
             batt_v = datadict.get("battery_1_voltage_charge", None) or datadict.get("battery_voltage_charge", None)
             if isinstance(bms_a, (int, float)) and isinstance(batt_v, (int, float)) and bms_a > 0 and batt_v > 0:
@@ -329,23 +338,24 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
             else:
                 reg_a = datadict.get("battery_charge_max_current", 20)
                 bms_cap_w = int(reg_a * (batt_v if isinstance(batt_v, (int, float)) and batt_v > 0 else 360))
-
-            # Desired charging power is the remainder of surplus after export_target, limited by BMS and SoC
+            # --- Surplus Split: battery gets the remainder after export_target, but limited by BMS and SoC ---
             rest_for_batt = max(0, surplus - export_target)
             if rest_for_batt > DEADBAND_W and soc < max_charge_soc:
+                # Negative pushmode_power means battery charging (see sign convention below)
                 desired_charge = int(min(rest_for_batt, bms_cap_w))
                 pushmode_power = -desired_charge
             else:
                 desired_charge = 0
                 pushmode_power = 0
-
             _LOGGER.info(
                 f"[Mode8 Feed-in] split: f={f:.2f} (raw={factor_pct}%) surplus={surplus}W export_base={export_base}W "
                 f"export_target={export_target}W rest_for_batt={rest_for_batt}W bms_cap≈{bms_cap_w}W -> charge={desired_charge}W"
             )
         else:
+            # --- Deficit: Discharge battery to cover deficit, then import remaining deficit from grid ---
             deficit = houseload - pv
             if soc > min_discharge_soc:
+                # Positive pushmode_power means battery discharge (see sign convention below)
                 pushmode_power = min(deficit, 30000)
             else:
                 pushmode_power = 0
@@ -353,6 +363,8 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                 f"[Mode8 Feed-in] deficit: deficit={deficit}W soc={soc}% chosen_push={pushmode_power}W"
             )
 
+        # --- Import Shaving: Ensure import from grid does not exceed import_limit ---
+        # If import would exceed the configured import limit, increase battery discharge to compensate.
         excess_import = houseload - pv - pushmode_power - import_limit
         if soc > min_discharge_soc and excess_import > 0:
             pushmode_power = pushmode_power + excess_import
@@ -360,20 +372,18 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                 f"[Mode8 Feed-in] import shaving applied: excess_import={excess_import}W -> new_push={pushmode_power}W"
             )
 
-        # --- Deadband with surplus/deficit guards ---
+        # --- Deadband: Hold battery power if net flow is close to zero unless special conditions apply ---
+        # Deadband prevents oscillation when net grid flow is near zero.
+        # Deadband is NOT applied if:
+        #   - We are in deficit, battery can discharge, and real import is noticeable
+        #   - Surplus charging is specifically requested (factor > 0)
         net_flow = pv - houseload + pushmode_power  # >0 export, <0 import
         is_deficit = pv < houseload
         can_discharge = soc > min_discharge_soc
         measured_import = datadict.get("grid_import", 0) or 0
-
         apply_deadband = (abs(net_flow) < DEADBAND_W)
-
         # recognize when we deliberately want to CHARGE in surplus due to factor > 0
         charging_requested = (not is_deficit) and (soc < max_charge_soc) and (f > 0.0) and (rest_for_batt > DEADBAND_W)
-
-        # Do NOT apply deadband when:
-        # - deficit & we may discharge & real import noticeable  OR
-        # - surplus charging is requested (factor>0)
         if apply_deadband and not ((is_deficit and can_discharge and measured_import > DEADBAND_W / 2) or charging_requested):
             _LOGGER.debug(
                 f"[Mode8 Feed-in] deadband: net_flow={net_flow}W within ±{DEADBAND_W}W -> holding last_push={last_push}W"
@@ -384,7 +394,8 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                 f"[Mode8 Feed-in] deadband skipped (deficit={is_deficit}, can_discharge={can_discharge}, charging_requested={charging_requested}, measured_import={measured_import}W)"
             )
 
-        # --- Slew-rate limiting (unchanged logic) ---
+        # --- Slew Rate Limiting: Limit how fast battery power can change between steps ---
+        # Slew rate prevents abrupt changes in battery power, except if import limit is exceeded (then we react fast).
         new_delta = pushmode_power - last_push
         if not (soc > min_discharge_soc and excess_import > 0):
             if new_delta > MAX_STEP_W:
@@ -399,6 +410,10 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                 pushmode_power = last_push - MAX_STEP_W
 
         # --- Final summary with correct net_flow ---
+        # pushmode_power sign convention:
+        #   - Negative: battery charging (absorbing surplus)
+        #   - Positive: battery discharging (covering deficit)
+        # net_flow: >0 means export to grid, <0 means import from grid
         net_flow = pv - houseload + pushmode_power  # >0 export, <0 import
         _LOGGER.info(
             f"[Mode8 Feed-in] result: push={pushmode_power}W pvlimit={pvlimit}W net_flow={net_flow}W "
