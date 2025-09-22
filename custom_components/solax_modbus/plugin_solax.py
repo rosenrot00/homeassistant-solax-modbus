@@ -372,19 +372,19 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                 f"[Mode8 Feed-in] import shaving applied: excess_import={excess_import}W -> new_push={pushmode_power}W"
             )
 
-        # --- Deadband: Hold battery power if net flow is close to zero unless special conditions apply ---
-        # Deadband prevents oscillation when net grid flow is near zero.
-        # Deadband is NOT applied if:
-        #   - We are in deficit, battery can discharge, and real import is noticeable
-        #   - Surplus charging is specifically requested (factor > 0)
+        # --- Deadband with strict deficit rule ---
         net_flow = pv - houseload + pushmode_power  # >0 export, <0 import
         is_deficit = pv < houseload
         can_discharge = soc > min_discharge_soc
         measured_import = datadict.get("grid_import", 0) or 0
+
         apply_deadband = (abs(net_flow) < DEADBAND_W)
+
         # recognize when we deliberately want to CHARGE in surplus due to factor > 0
         charging_requested = (not is_deficit) and (soc < max_charge_soc) and (f > 0.0) and (rest_for_batt > DEADBAND_W)
-        if apply_deadband and not ((is_deficit and can_discharge and measured_import > DEADBAND_W / 2) or charging_requested):
+
+        # NEVER hold last_push in deficit (to avoid accidental export). Only consider deadband in surplus.
+        if apply_deadband and not (is_deficit or charging_requested):
             _LOGGER.debug(
                 f"[Mode8 Feed-in] deadband: net_flow={net_flow}W within ±{DEADBAND_W}W -> holding last_push={last_push}W"
             )
@@ -408,6 +408,13 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
                     f"[Mode8 Feed-in] slew-limit: delta={new_delta}W capped to -{MAX_STEP_W}W"
                 )
                 pushmode_power = last_push - MAX_STEP_W
+
+        # --- Deficit safety clamp: never exceed current deficit with discharge ---
+        if pv < houseload:
+            deficit_now = houseload - pv
+            if pushmode_power > deficit_now:
+                _LOGGER.info(f"[Mode8 Feed-in] clamp discharge to deficit: push={pushmode_power}W -> {deficit_now}W (pv={pv} hl={houseload})")
+                pushmode_power = deficit_now
 
         # --- Final summary with correct net_flow ---
         # pushmode_power sign convention:
