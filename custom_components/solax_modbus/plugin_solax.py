@@ -250,6 +250,161 @@ def autorepeat_function_powercontrolmode8_recompute(initval, descr, datadict):
     elif power_control == "Negative Injection and Consumption Price":  # disable PV, charge from grid
         pvlimit = 0 
         pushmode_power = houseload - import_limit
+    elif power_control == "Feed-in/Battery Balance":
+        # Surplus case: send PV to the grid first (up to export_limit), then charge the battery with the remainder
+        # Deficit case: discharge the battery first (down to min_discharge_soc), then import the remaining deficit from the grid
+        DEADBAND_W = 100     # deadband around zero net flow to avoid oscillation
+        MAX_STEP_W = 2000    # maximum change per loop step unless import limit is exceeded
+
+        pv        = datadict.get("pv_power_total", 0)
+        houseload = value_function_house_load(initval, descr, datadict)
+
+        # Apply readscale (e.g., Gen4 often uses 10x). If the Number/Sensor already applied readscale,
+        # this heuristic avoids double-scaling by only multiplying when the raw value looks like "hundreds" of watts.
+        export_limit_raw = datadict.get("export_control_user_limit", 30000)
+        readscale_cfg = datadict.get("config_export_control_limit_readscale", 1)
+        try:
+            readscale = float(readscale_cfg) if readscale_cfg is not None else 1.0
+        except Exception:
+            readscale = 1.0
+
+        # Heuristic: if readscale>1 and raw limit is small (<1000), treat it as scaled units and multiply.
+        if readscale > 1.0 and isinstance(export_limit_raw, (int, float)) and export_limit_raw < 1000:
+            export_limit_eff = int(export_limit_raw * readscale)
+        else:
+            export_limit_eff = int(export_limit_raw)
+
+        # clamp to sane range and log both raw and effective values
+        export_limit  = max(0, min(60000, export_limit_eff))
+        import_limit  = datadict.get("remotecontrol_import_limit", 20000)
+        _LOGGER.info(
+            f"[Mode8 Feed-in] export_limit(raw={export_limit_raw}, readscale={readscale}) -> effective={export_limit}W"
+        )
+
+        soc            = datadict.get("battery_capacity", 0)
+        min_discharge_soc = datadict.get("selfuse_discharge_min_soc", 10)
+        max_charge_soc    = datadict.get("battery_charge_upper_soc", 100)
+
+        pvlimit = max(0, datadict.get("remotecontrol_pv_power_limit", 30000))
+
+        last_push = datadict.get("_mode8_last_push", 0)
+        pushmode_power = 0  # positive = discharge, negative = charge
+
+        _LOGGER.info(
+            f"[Mode8 Feed-in] inputs pv={pv}W hl={houseload}W exp_lim={export_limit}W imp_lim={import_limit}W "
+            f"soc={soc}% min_soc={min_discharge_soc}% max_soc={max_charge_soc}% pvlimit={pvlimit}W last_push={last_push}W"
+        )
+
+        # Optional: log measured grid signals if available (helps to validate controller action)
+        measured_power = datadict.get("measured_power", None)           # sign depends on meter (export/import)
+        grid_export_s = datadict.get("grid_export", None)               # our computed sensor, if present
+        grid_import_s = datadict.get("grid_import", None)
+
+        _LOGGER.info(
+            "[Mode8 Feed-in] probes: "
+            f"measured_power={measured_power if measured_power is not None else 'n/a'} "
+            f"grid_export={grid_export_s if grid_export_s is not None else 'n/a'} "
+            f"grid_import={grid_import_s if grid_import_s is not None else 'n/a'}"
+        )
+
+        if pv >= houseload:
+            surplus = pv - houseload
+            export_base = min(export_limit, surplus)  # what WR would export at most
+
+            # Factor 0..1 from UI (%): 0% => full feed-in, 100% => max battery charge
+            factor_pct = datadict.get("feedin_battery_balance", 100)
+            try:
+                f = max(0.0, min(1.0, float(factor_pct) / 100.0))
+            except Exception:
+                f = 1.0
+
+            # Target export according to factor split
+            export_target = int((1.0 - f) * export_base)
+
+            # Estimate BMS charging capability (A*V) if available; fallback to Register-based cap
+            bms_a = datadict.get("bms_charge_max_current", None)
+            batt_v = datadict.get("battery_1_voltage_charge", None) or datadict.get("battery_voltage_charge", None)
+            if isinstance(bms_a, (int, float)) and isinstance(batt_v, (int, float)) and bms_a > 0 and batt_v > 0:
+                bms_cap_w = int(bms_a * batt_v)
+            else:
+                reg_a = datadict.get("battery_charge_max_current", 20)
+                bms_cap_w = int(reg_a * (batt_v if isinstance(batt_v, (int, float)) and batt_v > 0 else 360))
+
+            # Desired charging power is the remainder of surplus after export_target, limited by BMS and SoC
+            rest_for_batt = max(0, surplus - export_target)
+            if rest_for_batt > DEADBAND_W and soc < max_charge_soc:
+                desired_charge = int(min(rest_for_batt, bms_cap_w))
+                pushmode_power = -desired_charge
+            else:
+                desired_charge = 0
+                pushmode_power = 0
+
+            _LOGGER.info(
+                f"[Mode8 Feed-in] split: f={f:.2f} (raw={factor_pct}%) surplus={surplus}W export_base={export_base}W "
+                f"export_target={export_target}W rest_for_batt={rest_for_batt}W bms_cap≈{bms_cap_w}W -> charge={desired_charge}W"
+            )
+        else:
+            deficit = houseload - pv
+            if soc > min_discharge_soc:
+                pushmode_power = min(deficit, 30000)
+            else:
+                pushmode_power = 0
+            _LOGGER.debug(
+                f"[Mode8 Feed-in] deficit: deficit={deficit}W soc={soc}% chosen_push={pushmode_power}W"
+            )
+
+        excess_import = houseload - pv - pushmode_power - import_limit
+        if soc > min_discharge_soc and excess_import > 0:
+            pushmode_power = pushmode_power + excess_import
+            _LOGGER.info(
+                f"[Mode8 Feed-in] import shaving applied: excess_import={excess_import}W -> new_push={pushmode_power}W"
+            )
+
+        # --- Deadband with surplus/deficit guards ---
+        net_flow = pv - houseload + pushmode_power  # >0 export, <0 import
+        is_deficit = pv < houseload
+        can_discharge = soc > min_discharge_soc
+        measured_import = datadict.get("grid_import", 0) or 0
+
+        apply_deadband = (abs(net_flow) < DEADBAND_W)
+
+        # recognize when we deliberately want to CHARGE in surplus due to factor > 0
+        charging_requested = (not is_deficit) and (soc < max_charge_soc) and (f > 0.0) and (rest_for_batt > DEADBAND_W)
+
+        # Do NOT apply deadband when:
+        # - deficit & we may discharge & real import noticeable  OR
+        # - surplus charging is requested (factor>0)
+        if apply_deadband and not ((is_deficit and can_discharge and measured_import > DEADBAND_W / 2) or charging_requested):
+            _LOGGER.debug(
+                f"[Mode8 Feed-in] deadband: net_flow={net_flow}W within ±{DEADBAND_W}W -> holding last_push={last_push}W"
+            )
+            pushmode_power = last_push
+        else:
+            _LOGGER.debug(
+                f"[Mode8 Feed-in] deadband skipped (deficit={is_deficit}, can_discharge={can_discharge}, charging_requested={charging_requested}, measured_import={measured_import}W)"
+            )
+
+        # --- Slew-rate limiting (unchanged logic) ---
+        new_delta = pushmode_power - last_push
+        if not (soc > min_discharge_soc and excess_import > 0):
+            if new_delta > MAX_STEP_W:
+                _LOGGER.debug(
+                    f"[Mode8 Feed-in] slew-limit: delta={new_delta}W capped to +{MAX_STEP_W}W"
+                )
+                pushmode_power = last_push + MAX_STEP_W
+            elif new_delta < -MAX_STEP_W:
+                _LOGGER.debug(
+                    f"[Mode8 Feed-in] slew-limit: delta={new_delta}W capped to -{MAX_STEP_W}W"
+                )
+                pushmode_power = last_push - MAX_STEP_W
+
+        # --- Final summary with correct net_flow ---
+        net_flow = pv - houseload + pushmode_power  # >0 export, <0 import
+        _LOGGER.info(
+            f"[Mode8 Feed-in] result: push={pushmode_power}W pvlimit={pvlimit}W net_flow={net_flow}W "
+            f"(>0 export, <0 import by sign convention)"
+        )
+        datadict["_mode8_last_push"] = pushmode_power
     elif power_control == "Disabled":
         pvlimit = setpvlimit
     # limit import to max import (capacity tarif in some countries)
@@ -812,6 +967,21 @@ NUMBER_TYPES = [
         write_method=WRITE_DATA_LOCAL,
         fmt="i",
         suggested_display_precision=0,
+    ),
+
+    SolaxModbusNumberEntityDescription(
+        name="Feed-in/Battery Balance (%)",
+        key="feedin_battery_balance",
+        allowedtypes=AC | HYBRID | GEN4 | GEN5,
+        native_min_value=0,
+        native_max_value=100,
+        native_step=1,
+        fmt="i",
+        initvalue=100,
+        native_unit_of_measurement=PERCENTAGE,
+        write_method=WRITE_DATA_LOCAL,
+        suggested_display_precision=0,
+        icon="mdi:battery-plus",
     ),
 
     SolaxModbusNumberEntityDescription(
@@ -1665,7 +1835,7 @@ SELECT_TYPES = [
     #
     ###
     SolaxModbusSelectEntityDescription(
-        name="Remotecontrol Power Control (mode 1)",
+        name="Remotecontrol Power Control (mode 1-9)",
         key="remotecontrol_power_control",
         unit=REGISTER_U16,
         write_method=WRITE_DATA_LOCAL,
@@ -1707,6 +1877,7 @@ SELECT_TYPES = [
             8:  "Mode 8 - PV and BAT control - Duration",
             81: "Negative Injection Price",
             82: "Negative Injection and Consumption Price",
+            83: "Feed-in/Battery Balance",
             # 9:  "Mode 9 - PV and BAT control - Target SOC",  
         },
         allowedtypes=AC | HYBRID | GEN4 | GEN5,
