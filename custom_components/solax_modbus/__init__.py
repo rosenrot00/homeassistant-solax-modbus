@@ -546,53 +546,85 @@ class SolaXModbusHub:
         # This is the first sensor, set up interval.
         interval = self.scan_group(sensor)
         interval_group = self.groups.setdefault(interval, empty_hub_interval_group_lambda())
+    
         if not interval_group.device_groups:
             interval_group.interval = interval
-
+    
             async def _refresh(_now: Optional[int] = None) -> None:
                 secs = interval_group.interval
                 self.cyclecount += 1
                 cycle_id = self.cyclecount
                 _LOGGER.debug(f"{self._name}: [{secs}s] poll started – cycle #{cycle_id}")
+    
                 # If a previous cycle is still running, mark a catch-up and return quickly.
                 if interval_group.poll_lock.locked():
                     interval_group.pending_rerun = True
-                    _LOGGER.debug(f"{self._name}: [{secs}s] overrun – previous poll still running; scheduling immediate catch-up after it finishes")
+                    _LOGGER.debug(
+                        f"{self._name}: [{secs}s] overrun – previous poll still running; "
+                        f"scheduling immediate catch-up after it finishes"
+                    )
                     return
-
+    
                 # Run cycles back-to-back if a tick was missed while running (catch-up mode)
                 while True:
                     start = _mtime.monotonic()
-                    async with interval_group.poll_lock:
-                        await self._check_connection()
-                        agg_res, updated_sensors = await self.async_refresh_modbus_data(interval_group, _now, cycle_id=cycle_id)
+                    try:
+                        async with interval_group.poll_lock:
+                            await self._check_connection()
+    
+                            # --- Fehlerabsicherung + Debug-Logging ---
+                            res = await self.async_refresh_modbus_data(
+                                interval_group, _now, cycle_id=cycle_id
+                            )
+    
+                            if not isinstance(res, (tuple, list)) or len(res) != 2:
+                                _LOGGER.error(
+                                    f"{self._name}: async_refresh_modbus_data returned unexpected value: {res!r}"
+                                )
+                                return
+    
+                            agg_res, updated_sensors = res
+    
+                    except Exception as e:
+                        _LOGGER.exception(
+                            f"{self._name}: Exception during async_refresh_modbus_data: {e}"
+                        )
+                        return
+    
                     elapsed = _mtime.monotonic() - start
                     _LOGGER.debug(
                         f"{self._name}: [{secs}s] poll finished – cycle #{cycle_id}, "
                         f"duration={int(elapsed*1000)} ms, ok={agg_res}, "
                         f"sensors={updated_sensors}, slowdown={self.slowdown}"
                     )
-
+    
                     # If the configured interval is shorter than the actual run time, inform once per cycle
                     if elapsed >= (interval_group.interval or 0):
-                        _LOGGER.debug(f"{self._name}: [{secs}s] interval too short – cycle took {elapsed:.3f}s ≥ interval {interval_group.interval}s; running at max possible speed")
-
+                        _LOGGER.debug(
+                            f"{self._name}: [{secs}s] interval too short – cycle took "
+                            f"{elapsed:.3f}s ≥ interval {interval_group.interval}s; running at max possible speed"
+                        )
+    
                     # Immediate catch-up if a tick arrived during our run
                     if getattr(interval_group, "pending_rerun", False):
                         interval_group.pending_rerun = False
                         # Loop again immediately (no sleep) to catch up once
                         continue
                     break
-
+    
             _LOGGER.info(f"{self._name}: starting timer loop for interval group: {interval}")
             interval_group.unsub_interval_method = async_track_time_interval(
                 self._hass, _refresh, timedelta(seconds=interval)
             )
+    
         device_key = self.device_group_key(sensor.device_info)
         grp = interval_group.device_groups.setdefault(device_key, empty_hub_device_group_lambda())
-        _LOGGER.debug(f"{self._name}: adding sensor {sensor.entity_description.key} available: {sensor._attr_available} ")
+        _LOGGER.debug(
+            f"{self._name}: adding sensor {sensor.entity_description.key} "
+            f"available: {sensor._attr_available}"
+        )
         grp.sensors.append(sensor)
-        self.blocks_changed = True # will force rebuild_blocks to be called
+        self.blocks_changed = True  # will force rebuild_blocks to be called
 
 
     @callback
@@ -1721,3 +1753,4 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):
         else:
             _LOGGER.error(f"write_registers_multi expects a list of tuples 0x{address:02x} payload: {payload}")
         return None
+
