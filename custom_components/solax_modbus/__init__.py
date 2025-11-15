@@ -330,6 +330,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Register the hub."""
     hass.data[DOMAIN][hub._name] = {
         "hub": hub,
+        "entry_id": entry.entry_id,
     }
 
     # Tests on some systems have shown that establishing the Modbus connection
@@ -351,14 +352,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_unload_entry(hass, entry):
     """Unload SolaX modbus entry and tear down transports cleanly."""
-    name = entry.options.get("name")
+    # Try to get a human-readable name for logging
+    name = entry.options.get(CONF_NAME) or entry.data.get(CONF_NAME) or entry.title
     _LOGGER.debug(f"async_unload_entry called for {name} – state={entry.state}")
-    hub = hass.data.get(DOMAIN, {}).get(name, {}).get("hub")
-    if hub:
-        try:
-            await hub.async_stop()
-        except Exception as ex:
-            _LOGGER.warning(f"{name}: error during hub stop: {ex}")
+
+    domain_data = hass.data.get(DOMAIN, {})
+    hubs_to_stop = []
+    keys_to_remove = []
+
+    # Find all hub records that belong to this config entry
+    for hub_name, rec in list(domain_data.items()):
+        if rec.get("entry_id") == entry.entry_id:
+            hubs_to_stop.append((hub_name, rec.get("hub")))
+            keys_to_remove.append(hub_name)
+
+    # Fallback: if nothing matched by entry_id, try legacy lookup by name
+    if not hubs_to_stop and name in domain_data:
+        rec = domain_data.get(name, {})
+        hubs_to_stop.append((name, rec.get("hub")))
+        keys_to_remove.append(name)
+
+    # Stop all matching hubs
+    for hub_name, hub in hubs_to_stop:
+        if hub:
+            try:
+                _LOGGER.debug(f"{hub_name}: async_unload_entry – stopping hub")
+                await hub.async_stop()
+            except Exception as ex:
+                _LOGGER.warning(f"{hub_name}: error during hub stop: {ex}")
 
     # Unload platforms - this must succeed for reload to work properly
     # Always try to unload regardless of entry state - during reload, state might not be LOADED
@@ -374,11 +395,13 @@ async def async_unload_entry(hass, entry):
         _LOGGER.error(f"{name}: error during platform unload: {ex}")
         unload_ok = False
 
-    # Ensure removal from hass.data
-    try:
-        hass.data.get(DOMAIN, {}).pop(name, None)
-    except Exception as ex:
-        _LOGGER.warning(f"{name}: error removing from hass.data: {ex}")
+    # Ensure removal from hass.data for all hubs belonging to this entry
+    for hub_name in keys_to_remove:
+        try:
+            domain_data.pop(hub_name, None)
+            _LOGGER.debug(f"{hub_name}: removed from hass.data[{DOMAIN}]")
+        except Exception as ex:
+            _LOGGER.warning(f"{hub_name}: error removing from hass.data: {ex}")
 
     return unload_ok
 
