@@ -529,6 +529,11 @@ class SolaXModbusHub:
         self.inverterNameSuffix = config.get(CONF_INVERTER_NAME_SUFFIX)
         self.inverterPowerKw = config.get(CONF_INVERTER_POWER_KW, DEFAULT_INVERTER_POWER_KW)
         self._modbus_addr = modbus_addr
+        # Test-only DataHub 1000 register translation based on SolaX KB:
+        # 35000 + (port - 1) * 800 + (device - 1) * 40 + register
+        self.datahub_test_enabled = False
+        self.datahub_test_port = 1
+        self.datahub_test_device = self._modbus_addr
         self._seriesnumber = "still unknown"
         self.interface = interface
         self.read_serial_port = serial_port
@@ -1150,6 +1155,14 @@ class SolaXModbusHub:
         )
         await self._client.connect()
 
+    def _translate_register_address(self, address: int, unit: int | None = None) -> int:
+        """Translate logical plugin register to physical DataHub 1000 register for testing."""
+        if not getattr(self, "datahub_test_enabled", False):
+            return address
+        port = int(getattr(self, "datahub_test_port", 1) or 1)
+        device = int(getattr(self, "datahub_test_device", unit or self._modbus_addr) or (unit or self._modbus_addr))
+        return 35000 + ((port - 1) * 800) + ((device - 1) * 40) + address
+
     async def async_read_holding_registers(self, unit: int, address: int, count: int) -> Any:
         """Read holding registers using high-level pymodbus API."""
         async with self._lock:
@@ -1161,8 +1174,13 @@ class SolaXModbusHub:
             try:
                 # Use high-level API; unit key is provided via ADDR_KW for compatibility
                 kwargs = {ADDR_KW: unit} if unit is not None else {}
-                _LOGGER.debug(f"{self._name}: READ HOLDING {ADDR_KW}={unit} addr=0x{address:x} cnt={count}")
-                resp = await self._track_task(self._client.read_holding_registers(address=address, count=count, **kwargs))  # type: ignore[arg-type]
+                translated_address = self._translate_register_address(address, unit)
+                _LOGGER.debug(
+                    f"{self._name}: READ HOLDING {ADDR_KW}={unit} addr=0x{address:x} translated=0x{translated_address:x} cnt={count}"
+                )
+                resp = await self._track_task(
+                    self._client.read_holding_registers(address=translated_address, count=count, **kwargs)
+                )  # type: ignore[arg-type]
             except ModbusException as exception_error:
                 error = f"Error: device: {unit} address: 0x{address:x} -> {exception_error!s}"
                 _LOGGER.error(error)
@@ -1187,8 +1205,13 @@ class SolaXModbusHub:
             try:
                 # Use high-level API; unit key is provided via ADDR_KW for compatibility
                 kwargs = {ADDR_KW: unit} if unit is not None else {}
-                _LOGGER.debug(f"{self._name}: READ INPUT  {ADDR_KW}={unit} addr=0x{address:x} cnt={count}")
-                resp = await self._track_task(self._client.read_input_registers(address=address, count=count, **kwargs))  # type: ignore[arg-type]
+                translated_address = self._translate_register_address(address, unit)
+                _LOGGER.debug(
+                    f"{self._name}: READ INPUT  {ADDR_KW}={unit} addr=0x{address:x} translated=0x{translated_address:x} cnt={count}"
+                )
+                resp = await self._track_task(
+                    self._client.read_input_registers(address=translated_address, count=count, **kwargs)
+                )  # type: ignore[arg-type]
             except ModbusException as exception_error:
                 error = f"Error: device: {unit} address: 0x{address:x} -> {exception_error!s}"
                 _LOGGER.error(error)
@@ -1205,10 +1228,13 @@ class SolaXModbusHub:
     async def async_lowlevel_write_register(self, unit: int, address: int, payload: int) -> Any:
         kwargs: dict[str, int] = {ADDR_KW: unit} if unit is not None else {}
         regs = convert_to_registers(int(payload), DataType.INT16, self.plugin.order32)  # type: ignore[attr-defined]  # DataType compat layer
+        translated_address = self._translate_register_address(address, unit)
         async with self._lock:
             await self._check_connection()
             try:
-                resp = await self._track_task(self._client.write_register(address=address, value=regs[0], **kwargs))  # type: ignore[arg-type]
+                resp = await self._track_task(
+                    self._client.write_register(address=translated_address, value=regs[0], **kwargs)
+                )  # type: ignore[arg-type]
                 # Plugin-level logging hook
                 if hasattr(self.plugin, "log_register_write"):
                     self.plugin.log_register_write(self, address, unit, payload, result=resp)
@@ -1246,10 +1272,13 @@ class SolaXModbusHub:
         """Write registers multi, but write only one register of type 16bit"""
         regs = convert_to_registers(int(payload), DataType.INT16, self.plugin.order32)  # type: ignore[attr-defined]  # DataType compat layer
         kwargs = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         async with self._lock:
             await self._check_connection()
             try:
-                resp = await self._track_task(self._client.write_registers(address=address, values=regs, **kwargs))  # type: ignore[arg-type]
+                resp = await self._track_task(
+                    self._client.write_registers(address=translated_address, values=regs, **kwargs)
+                )  # type: ignore[arg-type]
             except (ConnectionException, ModbusIOException) as e:
                 original_message = str(e)
                 raise HomeAssistantError(f"Error writing single Modbus registers: {original_message}") from e
@@ -1268,6 +1297,7 @@ class SolaXModbusHub:
         32bit integers will be converted to 2 modbus register values according to the endian strategy of the plugin
         """
         kwargs: dict[str, int] = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         if isinstance(payload, list):
             regs_out = []
             for (
@@ -1323,11 +1353,15 @@ class SolaXModbusHub:
                 except Exception as ex:
                     _LOGGER.error(f"{self._name}: conversion for typ={typ} value={value} failed payload:{payload} with exception {ex}")
             online = await self.is_online()
-            _LOGGER.debug(f"Ready to write multiple registers at 0x{address:02x}: {regs_out} online: {online} ")
+            _LOGGER.debug(
+                f"Ready to write multiple registers at 0x{address:02x} translated=0x{translated_address:02x}: {regs_out} online: {online} "
+            )
             if online:
                 async with self._lock:
                     try:
-                        resp = await self._track_task(self._client.write_registers(address=address, values=regs_out, **kwargs))  # type: ignore[arg-type]
+                        resp = await self._track_task(
+                            self._client.write_registers(address=translated_address, values=regs_out, **kwargs)
+                        )  # type: ignore[arg-type]
                     except (ConnectionException, ModbusIOException) as e:
                         original_message = str(e)
                         raise HomeAssistantError(f"Error writing multiple Modbus registers: {original_message}") from e
@@ -2146,6 +2180,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
     async def async_read_holding_registers(self, unit: int, address: int, count: int) -> Any:
         """Read holding registers."""
         kwargs = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         if getattr(self, "_stopping", False):
             return None
         async with self._lock:
@@ -2155,7 +2190,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                 return None
             async with hub._lock:
                 try:
-                    resp = await self._track_task(hub._client.read_holding_registers(address=address, count=count, **kwargs))
+                    resp = await self._track_task(hub._client.read_holding_registers(address=translated_address, count=count, **kwargs))
                 except (ConnectionException, ModbusIOException) as e:
                     original_message = str(e)
                     raise HomeAssistantError(f"Error reading Modbus holding registers: {original_message}") from e
@@ -2166,6 +2201,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
     async def async_read_input_registers(self, unit: int, address: int, count: int) -> Any:
         """Read input registers."""
         kwargs = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         if getattr(self, "_stopping", False):
             return None
         async with self._lock:
@@ -2175,7 +2211,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                 return None
             async with hub._lock:
                 try:
-                    resp = await self._track_task(hub._client.read_input_registers(address=address, count=count, **kwargs))
+                    resp = await self._track_task(hub._client.read_input_registers(address=translated_address, count=count, **kwargs))
                 except (ConnectionException, ModbusIOException) as e:
                     original_message = str(e)
                     raise HomeAssistantError(f"Error reading Modbus input registers: {original_message}") from e
@@ -2189,6 +2225,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
         """
         regs = convert_to_registers(int(payload), DataType.INT16, self.plugin.order32)  # type: ignore[attr-defined]
         kwargs = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         if getattr(self, "_stopping", False):
             return None
         async with self._lock:
@@ -2198,7 +2235,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                 return None
             async with hub._lock:
                 try:
-                    resp = await self._track_task(hub._client.write_register(address=address, value=regs[0], **kwargs))
+                    resp = await self._track_task(hub._client.write_register(address=translated_address, value=regs[0], **kwargs))
                     # Plugin-level logging hook
                     if hasattr(self.plugin, "log_register_write"):
                         self.plugin.log_register_write(self, address, unit, payload, result=resp)
@@ -2216,6 +2253,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
         """Write registers multi, but write only one register of type 16bit"""
         regs = convert_to_registers(int(payload), DataType.INT16, self.plugin.order32)  # type: ignore[attr-defined]
         kwargs: dict[str, int] = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         async with self._lock:
             hub = await self._check_connection()
         try:
@@ -2223,7 +2261,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                 return None
             async with hub._lock:
                 try:
-                    resp = await self._client.write_registers(address=address, values=regs, **kwargs)  # type: ignore[arg-type]
+                    resp = await self._client.write_registers(address=translated_address, values=regs, **kwargs)  # type: ignore[arg-type]
                 except (ConnectionException, ModbusIOException) as e:
                     original_message = str(e)
                     raise HomeAssistantError(f"Error writing single Modbus registers: {original_message}") from e
@@ -2245,6 +2283,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
         32bit integers will be converted to 2 modbus register values according to the endian strategy of the plugin
         """
         kwargs: dict[str, int] = {ADDR_KW: unit} if unit is not None else {}
+        translated_address = self._translate_register_address(address, unit)
         if isinstance(payload, list):
             regs_out = []
             for (
@@ -2281,7 +2320,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                 else:
                     _LOGGER.error(f"unsupported unit type: {typ} for {key}")
             # for easier debugging, make next line a _LOGGER.info line
-            _LOGGER.debug(f"Ready to write multiple registers at 0x{address:02x}: {regs_out}")
+            _LOGGER.debug(f"Ready to write multiple registers at 0x{address:02x} translated=0x{translated_address:02x}: {regs_out}")
             async with self._lock:
                 hub = await self._check_connection()
             try:
@@ -2289,7 +2328,7 @@ class SolaXCoreModbusHub(SolaXModbusHub, CoreModbusHub):  # type: ignore[misc]
                     return None
                 async with hub._lock:
                     try:
-                        resp = await self._client.write_registers(address=address, values=regs_out, **kwargs)  # type: ignore[arg-type]
+                        resp = await self._client.write_registers(address=translated_address, values=regs_out, **kwargs)  # type: ignore[arg-type]
                     except (ConnectionException, ModbusIOException) as e:
                         original_message = str(e)
                         raise HomeAssistantError(f"Error writing multiple Modbus registers: {original_message}") from e
