@@ -31,7 +31,7 @@ jobs:
     if: github.event_name == 'pull_request_target' && github.event.action == 'closed'
     steps:
       - name: Delete preview releases for PR
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         with:
@@ -127,6 +127,8 @@ jobs:
             core.setOutput("number", String(pr.number));
             core.setOutput("head_sha", pr.head.sha);
             core.setOutput("head_ref", pr.head.ref);
+            core.setOutput("title", pr.title ?? "");
+            core.setOutput("body", pr.body ?? "");
 
       - name: Remove outdated preview for this PR and compute next sequence
         id: sequence
@@ -171,9 +173,10 @@ jobs:
 
             let nextSequence = 1;
             for (const release of matching) {
-              const match = release.tag_name.match(new RegExp(`^preview-pr-${prNumber}-(\\d+)$`));
+              const match = release.tag_name.match(new RegExp(`-pr${prNumber}(?:-(\\d+))?$`));
               if (match) {
-                nextSequence = Math.max(nextSequence, Number(match[1]) + 1);
+                const releaseSequence = match[1] ? Number(match[1]) + 1 : 2;
+                nextSequence = Math.max(nextSequence, releaseSequence);
               }
             }
 
@@ -190,6 +193,8 @@ jobs:
           PREVIEW_PR: ${{ steps.pr.outputs.number }}
           PREVIEW_SHA: ${{ steps.pr.outputs.head_sha }}
           PREVIEW_REF: ${{ steps.pr.outputs.head_ref }}
+          PREVIEW_TITLE: ${{ steps.pr.outputs.title }}
+          PREVIEW_BODY: ${{ steps.pr.outputs.body }}
           PREVIEW_SEQUENCE: ${{ steps.sequence.outputs.value }}
         with:
           script: |
@@ -197,20 +202,60 @@ jobs:
             const prNumber = process.env.PREVIEW_PR;
             const sha = process.env.PREVIEW_SHA;
             const ref = process.env.PREVIEW_REF;
+            const prTitle = (process.env.PREVIEW_TITLE || "").trim();
+            const prBody = (process.env.PREVIEW_BODY || "").trim();
             const sequence = process.env.PREVIEW_SEQUENCE;
-            const tag = `preview-pr-${prNumber}-${sequence}`;
-            const name = `Preview PR #${prNumber} (${sequence})`;
-            const body = [
-              "Automated preview release for HACS testing.",
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const stable = releases.find((release) => !release.prerelease && !release.draft);
+
+            const nextStableVersion = (() => {
+              const fallback = "0.0.1";
+              if (!stable?.tag_name) {
+                return fallback;
+              }
+              const match = stable.tag_name.match(/^(\\d+)\\.(\\d+)\\.(\\d+)$/);
+              if (!match) {
+                return fallback;
+              }
+              const year = Number(match[1]);
+              const month = Number(match[2]);
+              const patch = Number(match[3]) + 1;
+              return `${year}.${String(month).padStart(2, "0")}.${patch}`;
+            })();
+
+            const suffix = sequence === "1" ? "" : `-${Number(sequence) - 1}`;
+            const tag = `${nextStableVersion}-pr${prNumber}${suffix}`;
+            const name = tag;
+
+            const visibleBodyParts = [];
+            if (prTitle) {
+              visibleBodyParts.push(prTitle);
+            }
+            if (prBody) {
+              visibleBodyParts.push("", prBody);
+            }
+            visibleBodyParts.push(
               "",
-              `Preview-PR: ${prNumber}`,
-              `Preview-Sequence: ${sequence}`,
-              `Branch: ${ref}`,
-              `Commit: ${sha}`,
-              "Managed-By: hacs-preview",
+              "---",
               "",
-              "This preview is deleted automatically when the PR is closed or merged.",
-            ].join("\n");
+              "Preview release for testing this PR in HACS.",
+              "It is automatically replaced when the PR is updated and removed when the PR is closed or merged."
+            );
+
+            const hiddenMetadata = [
+              `<!-- Managed-By: hacs-preview -->`,
+              `<!-- Preview-PR: ${prNumber} -->`,
+              `<!-- Preview-Sequence: ${sequence} -->`,
+              `<!-- Branch: ${ref} -->`,
+              `<!-- Commit: ${sha} -->`,
+            ];
+
+            const body = [...visibleBodyParts, "", ...hiddenMetadata].join("\n");
 
             const { data: created } = await github.rest.repos.createRelease({
               owner,
