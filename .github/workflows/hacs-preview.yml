@@ -84,9 +84,21 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            const prNumber = context.eventName === "workflow_dispatch"
-              ? Number(core.getInput("pr_number"))
-              : context.payload.pull_request.number;
+            let prNumber;
+            if (context.eventName === "workflow_dispatch") {
+              const raw = context.payload.inputs?.pr_number;
+              if (!raw || Number.isNaN(Number(raw)) || Number(raw) <= 0) {
+                core.setFailed("workflow_dispatch requires a valid pr_number greater than 0.");
+                return;
+              }
+              prNumber = Number(raw);
+            } else {
+              prNumber = context.payload.pull_request?.number;
+              if (!prNumber || prNumber <= 0) {
+                core.setFailed(`No valid pull request number found in ${context.eventName} payload.`);
+                return;
+              }
+            }
 
             const { owner, repo } = context.repo;
             const { data: pr } = await github.rest.pulls.get({
