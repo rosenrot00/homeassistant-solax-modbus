@@ -205,7 +205,6 @@ jobs:
             const prTitle = (process.env.PREVIEW_TITLE || "").trim();
             const prBody = (process.env.PREVIEW_BODY || "").trim();
             const sequence = process.env.PREVIEW_SEQUENCE;
-
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner,
               repo,
@@ -227,7 +226,6 @@ jobs:
               const patch = Number(match[3]) + 1;
               return `${year}.${String(month).padStart(2, "0")}.${patch}`;
             })();
-
             const suffix = sequence === "1" ? "" : `-${Number(sequence) - 1}`;
             const tag = `${nextStableVersion}-pr${prNumber}${suffix}`;
             const name = tag;
