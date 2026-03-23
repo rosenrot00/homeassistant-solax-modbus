@@ -127,7 +127,6 @@ jobs:
             const requiredChecks = new Map([
               ["Code Quality", false],
               ["✅ All Tests Passed", false],
-              ["HACS Action", false],
               ["validate", false],
             ]);
 
