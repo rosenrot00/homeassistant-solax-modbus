@@ -171,12 +171,12 @@ jobs:
               release.body.includes(`Preview-PR: ${prNumber}`)
             );
 
-            let nextSequence = 1;
+            let nextSuffixNumber = 0;
             for (const release of matching) {
               const match = release.tag_name.match(new RegExp(`-pr${prNumber}(?:-(\\d+))?$`));
               if (match) {
-                const releaseSequence = match[1] ? Number(match[1]) + 1 : 2;
-                nextSequence = Math.max(nextSequence, releaseSequence);
+                const existingSuffixNumber = match[1] ? Number(match[1]) : 0;
+                nextSuffixNumber = Math.max(nextSuffixNumber, existingSuffixNumber + 1);
               }
             }
 
@@ -184,7 +184,7 @@ jobs:
               await deleteReleaseAndTag(release);
             }
 
-            core.setOutput("value", String(nextSequence));
+            core.setOutput("value", String(nextSuffixNumber));
 
       - name: Create preview release
         id: release
@@ -204,7 +204,7 @@ jobs:
             const ref = process.env.PREVIEW_REF;
             const prTitle = (process.env.PREVIEW_TITLE || "").trim();
             const prBody = (process.env.PREVIEW_BODY || "").trim();
-            const sequence = process.env.PREVIEW_SEQUENCE;
+            const suffixNumber = Number(process.env.PREVIEW_SEQUENCE || "0");
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner,
               repo,
@@ -226,7 +226,7 @@ jobs:
               const patch = Number(match[3]) + 1;
               return `${year}.${String(month).padStart(2, "0")}.${patch}`;
             })();
-            const suffix = sequence === "1" ? "" : `-${Number(sequence) - 1}`;
+            const suffix = suffixNumber === 0 ? "" : `-${suffixNumber}`;
             const tag = `${nextStableVersion}-pr${prNumber}${suffix}`;
             const name = tag;
 
@@ -248,7 +248,7 @@ jobs:
             const hiddenMetadata = [
               `<!-- Managed-By: hacs-preview -->`,
               `<!-- Preview-PR: ${prNumber} -->`,
-              `<!-- Preview-Sequence: ${sequence} -->`,
+              `<!-- Preview-Sequence: ${suffixNumber} -->`,
               `<!-- Branch: ${ref} -->`,
               `<!-- Commit: ${sha} -->`,
             ];
