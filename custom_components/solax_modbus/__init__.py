@@ -1145,6 +1145,9 @@ class SolaXModbusHub:
     async def async_connect(self) -> None:
         if getattr(self, "_stopping", False):
             return
+        if self._client.connected:
+            _LOGGER.debug(f"{self._name}: async_connect skipped - already connected")
+            return
         _LOGGER.debug(
             f"{self._name}: Trying to connect to Inverter at {self._client.comm_params.host}:{self._client.comm_params.port} connected: {self._client.connected} ",
         )
@@ -1166,13 +1169,11 @@ class SolaXModbusHub:
             except ModbusException as exception_error:
                 error = f"Error: device: {unit} address: 0x{address:x} -> {exception_error!s}"
                 _LOGGER.error(error)
-                # Flush transport: close + short pause + reconnect to clear any late/queued frames
-                _LOGGER.debug(f"{self._name}: ModbusException – flushing transport and reconnecting")
-                try:
-                    self._client.close()
-                finally:
-                    await asyncio.sleep(0.2)
-                    await self._client.connect()
+                if getattr(self, "_stopping", False):
+                    _LOGGER.debug(f"{self._name}: ModbusException during shutdown - skipping reconnect")
+                    return None
+                _LOGGER.debug(f"{self._name}: ModbusException – closing transport and deferring reconnect")
+                self._client.close()
                 return None
         return resp
 
@@ -1192,13 +1193,11 @@ class SolaXModbusHub:
             except ModbusException as exception_error:
                 error = f"Error: device: {unit} address: 0x{address:x} -> {exception_error!s}"
                 _LOGGER.error(error)
-                # Flush transport: close + short pause + reconnect to clear any late/queued frames
-                _LOGGER.debug(f"{self._name}: ModbusException – flushing transport and reconnecting")
-                try:
-                    self._client.close()
-                finally:
-                    await asyncio.sleep(0.2)
-                    await self._client.connect()
+                if getattr(self, "_stopping", False):
+                    _LOGGER.debug(f"{self._name}: ModbusException during shutdown - skipping reconnect")
+                    return None
+                _LOGGER.debug(f"{self._name}: ModbusException – closing transport and deferring reconnect")
+                self._client.close()
                 return None
         return resp
 
