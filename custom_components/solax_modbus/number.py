@@ -112,6 +112,7 @@ class SolaXModbusNumber(NumberEntity):
         self._attr_native_min_value: float = number_info.native_min_value  # type: ignore[assignment]
         self._attr_native_max_value: float = number_info.native_max_value  # type: ignore[assignment]
         self._attr_scale = number_info.scale
+        self._base_entity_description = number_info
         self.entity_description = number_info
         if number_info.max_exceptions:
             for (
@@ -252,5 +253,10 @@ class SolaXModbusNumber(NumberEntity):
                 # corresponding_sensor.async_write_ha_state()
             self._hub.localsUpdated = True  # mark to save permanently
         self._hub.data[self._key] = value  # / self.entity_description.read_scale
+        if self._write_method == WRITE_DATA_LOCAL:
+            try:
+                self._hub.plugin.localDataCallback(self._hub)
+            except Exception:
+                _LOGGER.debug("%s: localDataCallback failed after local write for %s", self._platform_name, self._key, exc_info=True)
         # _LOGGER.info(f"*** data written part 2 {self._key}: {self._hub.data[self._key]}")
         self.async_write_ha_state()  # is this needed ?

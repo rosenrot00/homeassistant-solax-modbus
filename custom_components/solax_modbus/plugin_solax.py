@@ -1151,6 +1151,43 @@ def value_function_battery_voltage_cell_difference(initval: int, descr: Any, dat
     return float(datadict.get("cell_voltage_high", 0)) - float(datadict.get("cell_voltage_low", 0))
 
 
+def _get_base_number_limits(entity: Any, hub: Any) -> tuple[float | None, float | None]:
+    """Return the original min/max limits for a number entity, including serial-based overrides."""
+    descr = getattr(entity, "_base_entity_description", entity.entity_description)
+    min_value = descr.native_min_value
+    max_value = descr.native_max_value
+    if getattr(descr, "max_exceptions", None):
+        for prefix, native_value in descr.max_exceptions:
+            if hub.seriesnumber.startswith(prefix):
+                max_value = native_value
+    if getattr(descr, "min_exceptions_minus", None):
+        for prefix, native_value in descr.min_exceptions_minus:
+            if hub.seriesnumber.startswith(prefix):
+                min_value = float(-native_value)
+    return min_value, max_value
+
+
+def _restore_number_defaults(entity: Any, hub: Any) -> None:
+    """Restore original number limits from the entity's base descriptor."""
+    min_value, max_value = _get_base_number_limits(entity, hub)
+    entity._attr_native_min_value = min_value
+    entity._attr_native_max_value = max_value
+    entity.entity_description = replace(
+        getattr(entity, "_base_entity_description", entity.entity_description),
+        native_min_value=min_value,
+        native_max_value=max_value,
+    )
+
+
+def _set_read_scale(entity: Any, new_read_scale: float | None) -> None:
+    """Apply a read_scale override while preserving the original descriptor."""
+    base_descr = getattr(entity, "_base_entity_description", entity.entity_description)
+    entity.entity_description = replace(
+        base_descr,
+        read_scale=base_descr.read_scale if new_read_scale is None else new_read_scale,
+    )
+
+
 # ================================= Button Declarations ============================================================
 
 BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
@@ -10156,23 +10193,30 @@ class solax_plugin(plugin_base):
         # only called after initial polling cycle and subsequent modifications to local data
         _LOGGER.info("local data update callback")
 
+        for key in [
+            "remotecontrol_active_power",
+            "remotecontrol_import_limit",
+            "export_control_user_limit",
+            "generator_max_charge",
+        ]:
+            number_entity = hub.numberEntities.get(key)
+            if number_entity:
+                _restore_number_defaults(number_entity, hub)
+
+        export_limit_number = hub.numberEntities.get("export_control_user_limit")
+        export_limit_sensor = hub.sensorEntities.get("export_control_user_limit")
+        if export_limit_sensor:
+            _set_read_scale(export_limit_sensor, None)
+
         config_scale_entity = hub.numberEntities.get("config_export_control_limit_readscale")
         if config_scale_entity and config_scale_entity.enabled:
             new_read_scale = hub.data.get("config_export_control_limit_readscale")
             if new_read_scale is not None:
                 _LOGGER.info(f"local data update callback for read_scale: {new_read_scale} enabled: {config_scale_entity.enabled}")
-                number_entity = hub.numberEntities.get("export_control_user_limit")
-                sensor_entity = hub.sensorEntities.get("export_control_user_limit")
-                if number_entity:
-                    number_entity.entity_description = replace(
-                        number_entity.entity_description,
-                        read_scale=new_read_scale,
-                    )
-                if sensor_entity:
-                    sensor_entity.entity_description = replace(
-                        sensor_entity.entity_description,
-                        read_scale=new_read_scale,
-                    )
+                if export_limit_number:
+                    _set_read_scale(export_limit_number, new_read_scale)
+                if export_limit_sensor:
+                    _set_read_scale(export_limit_sensor, new_read_scale)
 
         # For parallel mode Master inverters, use inverter_power_kw for remote control limits
         # This allows proper ±limits for multi-inverter systems (e.g., 3× 15kW = ±45kW)
@@ -10202,6 +10246,7 @@ class solax_plugin(plugin_base):
                             native_max_value=system_limit_w,
                         )
                         _LOGGER.info(f"Parallel Master: Set {key} limits to ±{system_limit_w}W (inverter_power_kw={hub.inverterPowerKw}kW)")
+                    number_entity.async_write_ha_state()
 
         # For single inverters or if config_max_export is enabled, use config_max_export
         config_maxexport_entity = hub.numberEntities.get("config_max_export")
@@ -10219,10 +10264,16 @@ class solax_plugin(plugin_base):
                         number_entity._attr_native_max_value = new_max_export
                         # update description also, not sure whether needed or not
                         number_entity.entity_description = replace(
-                            number_entity.entity_description,
+                            getattr(number_entity, "_base_entity_description", number_entity.entity_description),
                             native_max_value=new_max_export,
                         )
                         _LOGGER.info(f"local data update callback for entity: {key} new limit: {new_max_export}")
+                        number_entity.async_write_ha_state()
+
+        if export_limit_number:
+            export_limit_number.async_write_ha_state()
+        if export_limit_sensor:
+            export_limit_sensor.async_write_ha_state()
 
         return False
 
