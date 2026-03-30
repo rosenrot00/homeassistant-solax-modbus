@@ -165,6 +165,56 @@ class SolaXModbusNumber(NumberEntity):
     def unique_id(self) -> str | None:
         return f"{self._platform_name}_{self._key}"
 
+    def _base_limits(self) -> tuple[float | None, float | None]:
+        """Return original descriptor limits, including serial-based overrides."""
+        descr = self._base_entity_description
+        min_value = descr.native_min_value
+        max_value = descr.native_max_value
+        if descr.max_exceptions:
+            for prefix, native_value in descr.max_exceptions:
+                if self._hub.seriesnumber.startswith(prefix):
+                    max_value = native_value
+        if descr.min_exceptions_minus:
+            for prefix, native_value in descr.min_exceptions_minus:
+                if self._hub.seriesnumber.startswith(prefix):
+                    min_value = float(-native_value)
+        return min_value, max_value
+
+    def _dynamic_limits(self) -> tuple[float | None, float | None]:
+        """Return runtime-adjusted min/max limits for entities with dynamic bounds."""
+        min_value, max_value = self._base_limits()
+        parallel_setting = self._hub.data.get("parallel_setting", "Free")
+
+        if self._key in {"remotecontrol_active_power", "remotecontrol_import_limit"} and parallel_setting == "Master":
+            system_limit_w = float(self._hub.inverterPowerKw * 1000)
+            if self._key == "remotecontrol_import_limit":
+                return 0, system_limit_w
+            return -system_limit_w, system_limit_w
+
+        if self._key in {
+            "remotecontrol_active_power",
+            "remotecontrol_import_limit",
+            "export_control_user_limit",
+            "generator_max_charge",
+        } and parallel_setting != "Master":
+            config_entity = self._hub.numberEntities.get("config_max_export")
+            config_enabled = bool(config_entity and getattr(config_entity, "enabled", True))
+            config_value = self._hub.data.get("config_max_export")
+            if config_enabled and config_value is not None:
+                max_value = float(config_value)
+
+        return min_value, max_value
+
+    @property
+    def native_min_value(self) -> float | None:
+        min_value, _ = self._dynamic_limits()
+        return min_value
+
+    @property
+    def native_max_value(self) -> float | None:
+        _, max_value = self._dynamic_limits()
+        return max_value
+
     @property
     def native_value(self) -> float | None:
         descr = self.entity_description
