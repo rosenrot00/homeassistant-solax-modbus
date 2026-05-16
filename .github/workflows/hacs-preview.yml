@@ -23,6 +23,7 @@ on:
 permissions:
   contents: write
   pull-requests: read
+  issues: write
   checks: read
 
 env:
