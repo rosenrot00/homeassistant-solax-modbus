@@ -335,7 +335,7 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const sha = process.env.HEAD_SHA;
-            const checkName = "✅ All Tests Passed";
+            const checkName = "✅ All Checks Passed";
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             const maxAttempts = 20;
             const delayMs = 30000;
