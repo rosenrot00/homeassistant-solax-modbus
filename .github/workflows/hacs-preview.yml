@@ -22,7 +22,7 @@ on:
 
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
   issues: write
   checks: read
 
@@ -534,6 +534,7 @@ jobs:
 
       - name: Comment on pull request
         if: steps.freshness.outputs.should_publish == 'true' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'
+        continue-on-error: true
         uses: actions/github-script@v8
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
