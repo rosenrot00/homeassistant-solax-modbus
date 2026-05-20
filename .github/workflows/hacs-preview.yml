@@ -76,7 +76,7 @@ jobs:
             );
 
             for (const release of previews) {
-              const match = release.body.match(/Preview-PR: (\\d+)/);
+              const match = release.body.match(/Preview-PR: (\d+)/);
               if (!match) {
                 continue;
               }
@@ -134,12 +134,17 @@ jobs:
               per_page: 100,
             });
 
-            const matching = releases.filter((release) =>
-              release.prerelease &&
-              typeof release.body === "string" &&
-              release.body.includes("Managed-By: hacs-preview") &&
-              release.body.includes(`Preview-PR: ${prNumber}`)
-            );
+            const managedPreviewForPr = (release) => {
+              if (!release.prerelease || typeof release.body !== "string") {
+                return false;
+              }
+              if (!release.body.includes("Managed-By: hacs-preview")) {
+                return false;
+              }
+              return release.body.match(/Preview-PR: (\d+)/)?.[1] === prNumber;
+            };
+
+            const matching = releases.filter(managedPreviewForPr);
 
             for (const release of matching) {
               await deleteReleaseAndTag(release);
@@ -310,13 +315,15 @@ jobs:
               per_page: 100,
             });
 
-            const currentPreviewExists = releases.some((release) =>
-              release.prerelease &&
-              typeof release.body === "string" &&
-              release.body.includes("Managed-By: hacs-preview") &&
-              release.body.includes(`Preview-PR: ${prNumber}`) &&
-              release.body.includes(`Commit: ${sha}`)
-            );
+            const currentPreviewExists = releases.some((release) => {
+              if (!release.prerelease || typeof release.body !== "string") {
+                return false;
+              }
+              if (!release.body.includes("Managed-By: hacs-preview")) {
+                return false;
+              }
+              return release.body.match(/Preview-PR: (\d+)/)?.[1] === prNumber && release.body.includes(`Commit: ${sha}`);
+            });
 
             if (currentPreviewExists) {
               core.info(`Preview for PR #${prNumber} already points to ${sha}; skipping scheduled rebuild.`);
@@ -390,7 +397,7 @@ jobs:
               return;
             }
 
-      - name: Remove outdated preview for this PR and compute next sequence
+      - name: Compute next preview sequence
         if: steps.freshness.outputs.should_publish == 'true'
         id: sequence
         uses: actions/github-script@v8
@@ -400,23 +407,14 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const prNumber = process.env.PREVIEW_PR;
-
-            const deleteReleaseAndTag = async (release) => {
-              core.info(`Deleting preview release ${release.tag_name}`);
-              await github.rest.repos.deleteRelease({
-                owner,
-                repo,
-                release_id: release.id,
-              });
-              try {
-                await github.rest.git.deleteRef({
-                  owner,
-                  repo,
-                  ref: `tags/${release.tag_name}`,
-                });
-              } catch (error) {
-                core.warning(`Could not delete tag ${release.tag_name}: ${error.message}`);
+            const managedPreviewForPr = (release) => {
+              if (!release.prerelease || typeof release.body !== "string") {
+                return false;
               }
+              if (!release.body.includes("Managed-By: hacs-preview")) {
+                return false;
+              }
+              return release.body.match(/Preview-PR: (\d+)/)?.[1] === prNumber;
             };
 
             const releases = await github.paginate(github.rest.repos.listReleases, {
@@ -425,12 +423,7 @@ jobs:
               per_page: 100,
             });
 
-            const matching = releases.filter((release) =>
-              release.prerelease &&
-              typeof release.body === "string" &&
-              release.body.includes("Managed-By: hacs-preview") &&
-              release.body.includes(`Preview-PR: ${prNumber}`)
-            );
+            const matching = releases.filter(managedPreviewForPr);
 
             let nextSuffixNumber = 0;
             for (const release of matching) {
@@ -439,10 +432,6 @@ jobs:
                 const existingSuffixNumber = match[1] ? Number(match[1]) : 0;
                 nextSuffixNumber = Math.max(nextSuffixNumber, existingSuffixNumber + 1);
               }
-            }
-
-            for (const release of matching) {
-              await deleteReleaseAndTag(release);
             }
 
             core.setOutput("value", String(nextSuffixNumber));
@@ -504,7 +493,7 @@ jobs:
               "---",
               "",
               "Preview release for testing this PR in HACS.",
-              "It is automatically replaced when the PR is updated and removed when the PR is closed or merged."
+              "Older previews for the same PR are pruned automatically; the latest 5 are retained until the PR is closed or merged."
             );
 
             const hiddenMetadata = [
@@ -531,6 +520,65 @@ jobs:
 
             core.setOutput("html_url", created.html_url);
             core.setOutput("tag", created.tag_name);
+
+      - name: Keep latest preview releases for this PR
+        if: steps.freshness.outputs.should_publish == 'true'
+        uses: actions/github-script@v8
+        env:
+          PREVIEW_PR: ${{ steps.pr.outputs.number }}
+          RETENTION_LIMIT: "5"
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = process.env.PREVIEW_PR;
+            const retentionLimit = Number(process.env.RETENTION_LIMIT || "5");
+            const managedPreviewForPr = (release) => {
+              if (!release.prerelease || typeof release.body !== "string") {
+                return false;
+              }
+              if (!release.body.includes("Managed-By: hacs-preview")) {
+                return false;
+              }
+              return release.body.match(/Preview-PR: (\d+)/)?.[1] === prNumber;
+            };
+
+            const deleteReleaseAndTag = async (release) => {
+              core.info(`Deleting old preview release ${release.tag_name}`);
+              await github.rest.repos.deleteRelease({
+                owner,
+                repo,
+                release_id: release.id,
+              });
+              try {
+                await github.rest.git.deleteRef({
+                  owner,
+                  repo,
+                  ref: `tags/${release.tag_name}`,
+                });
+              } catch (error) {
+                core.warning(`Could not delete tag ${release.tag_name}: ${error.message}`);
+              }
+            };
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const matching = releases
+              .filter(managedPreviewForPr)
+              .sort((left, right) => {
+                const createdDiff = Date.parse(right.created_at) - Date.parse(left.created_at);
+                return createdDiff || right.id - left.id;
+              });
+
+            core.info(`Found ${matching.length} managed preview release(s) for PR #${prNumber}.`);
+            const stale = matching.slice(retentionLimit);
+            for (const release of stale) {
+              await deleteReleaseAndTag(release);
+            }
+            core.info(`Kept ${Math.min(matching.length, retentionLimit)} latest managed preview release(s) for PR #${prNumber}.`);
 
       - name: Comment on pull request
         if: steps.freshness.outputs.should_publish == 'true' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'
