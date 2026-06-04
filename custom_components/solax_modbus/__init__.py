@@ -32,7 +32,7 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
@@ -408,12 +408,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         register_energy_dashboard_switch_provider(hass)
     except Exception as ex:
         _LOGGER.debug(f"{hub.name}: Energy Dashboard switch provider registration failed: {ex}")
-    """Register the hub."""
-    hass.data[DOMAIN][hub._name] = {
-        "hub": hub,
-    }
-
-    await hub.async_init()
+    try:
+        setup_ready = await hub.async_init()
+    except Exception:
+        await hub.async_stop()
+        hass.data.get(DOMAIN, {}).pop(hub._name, None)
+        raise
+    if not setup_ready:
+        await hub.async_stop()
+        hass.data.get(DOMAIN, {}).pop(hub._name, None)
+        raise ConfigEntryNotReady(f"{hub.name}: inverter is not responding")
 
     entry.async_on_unload(entry.add_update_listener(config_entry_update_listener))
     return True
@@ -611,9 +615,8 @@ class SolaXModbusHub:
         self._initial_refresh_active: bool = False
         self._initial_refresh_done: bool = False
 
-        # Deferred setup state
+        # Platform setup state
         self._platforms_forwarded = False
-        self._deferred_setup_task: Any = None
 
         # _LOGGER.debug("solax modbushub done %s", self.__dict__)
 
@@ -627,18 +630,19 @@ class SolaXModbusHub:
             return
         self._initial_refresh_task = self._hass.loop.create_task(self._run_initial_refresh_when_ready())
 
-    async def async_init(self, *args: Any) -> None:  # noqa: D102
+    async def async_init(self, *args: Any) -> bool:  # noqa: D102
         import asyncio
         import time as _t
 
         self._init_task: Any = asyncio.current_task()
         # Exit early if teardown requested
         if getattr(self, "_stopping", False):
-            return
+            self._init_task = None
+            return False
 
         # Try to detect inverter type, but do not block setup indefinitely.
-        # We allow up to ~15s for initial detection; afterwards we proceed with a generic setup
-        # so that the integration is usable even with no device connected.
+        # We allow up to ~15s for initial detection; afterwards Home Assistant
+        # retries only this config entry via ConfigEntryNotReady.
         deadline = _t.monotonic() + 15.0
         attempts = 0
         while self._invertertype in (None, 0) and not getattr(self, "_stopping", False):
@@ -646,7 +650,8 @@ class SolaXModbusHub:
                 await self.async_connect()
                 await self._check_connection()
                 if getattr(self, "_stopping", False):
-                    return
+                    self._init_task = None
+                    return False
                 # Attempt type detection via plugin (may return 0/None if unreachable)
                 self._invertertype = await self.plugin.async_determineInverterType(self, self.config)
                 attempts += 1
@@ -656,22 +661,24 @@ class SolaXModbusHub:
                 _LOGGER.debug(f"{self._name}: inverter type detect attempt failed: {ex}")
                 attempts += 1
 
-            # Timeout reached → proceed to deferred setup if still not detected
+            # Timeout reached; let Home Assistant retry this config entry.
             if _t.monotonic() >= deadline:
                 break
 
             # Small paced wait to avoid tight loop; keep abortable while unloading
             for _ in range(100):
                 if getattr(self, "_stopping", False):
-                    return
+                    self._init_task = None
+                    return False
                 await asyncio.sleep(0.1)
 
-        # If we reach here with no inverter detected, start deferred detection and return without forwarding platforms
+        # If we reach here with no inverter detected, keep this entry unloaded.
+        # Returning ConfigEntryNotReady from async_setup_entry isolates offline
+        # entries from already running hubs and avoids reload loops.
         if self._invertertype in (None, 0):
-            _LOGGER.debug(f"{self._name}: no inverter detected during initial window – deferring setup until device is online")
-            if not getattr(self, "_stopping", False):
-                self._deferred_setup_task = self._hass.loop.create_task(self._deferred_setup_loop())
-            return
+            _LOGGER.debug(f"{self._name}: no inverter detected during initial window")
+            self._init_task = None
+            return False
 
         # Prepare device_info (inverter detected during initial window)
         plugin_name = self.plugin.plugin_name
@@ -689,7 +696,13 @@ class SolaXModbusHub:
 
         if getattr(self, "_stopping", False):
             _LOGGER.info(f"{self._name}: init aborted – stopping during init")
-            return
+            self._init_task = None
+            return False
+
+        # Publish the hub only after inverter detection succeeded. This keeps
+        # offline retry entries from being treated as active hubs by other
+        # config entries while Home Assistant retries their setup.
+        self._hass.data.setdefault(DOMAIN, {})[self._name] = {"hub": self}
 
         # Forward platforms for this config entry
         # Platforms should be unloaded before reload, so this should always succeed
@@ -710,53 +723,12 @@ class SolaXModbusHub:
             self._start_initial_refresh_if_needed()
 
         self._init_task = None
+        return True
 
     def _get_inverter_model(self) -> str | None:
         if self._has_local_inverter_model:
             return self.inverter_model
         return getattr(self.plugin, "inverter_model", None)
-
-    async def _deferred_setup_loop(self, interval: int = 30) -> None:
-        """Keep trying to detect inverter type and forward platforms once online."""
-        import asyncio
-
-        while (not getattr(self, "_stopping", False)) and (not self._platforms_forwarded):
-            try:
-                await self.async_connect()
-                await self._check_connection()
-                if getattr(self, "_stopping", False):
-                    return
-                inv = await self.plugin.async_determineInverterType(self, self.config)
-                if inv not in (None, 0):
-                    self._invertertype = inv
-                    _LOGGER.debug(f"{self._name}: inverter detected during deferred setup (type={inv}) – forwarding platforms")
-                    # Prepare/refresh device_info in case it wasn't set
-                    plugin_name = self.plugin.plugin_name
-                    if self.inverterNameSuffix:
-                        plugin_name = plugin_name + " " + self.inverterNameSuffix
-                    self.device_info = DeviceInfo(
-                        identifiers=cast(set[tuple[str, str]], {(DOMAIN, self._name, INVERTER_IDENT)}),
-                        manufacturer=self.plugin.plugin_manufacturer,
-                        model=self._get_inverter_model(),
-                        name=plugin_name,
-                        serial_number=self.seriesnumber,
-                        sw_version=self.plugin.getSoftwareVersion(self.data),
-                        hw_version=self.plugin.getHardwareVersion(self.data),
-                    )
-                    if getattr(self, "_stopping", False):
-                        return
-                    await self._hass.config_entries.async_forward_entry_setups(self.entry, PLATFORMS)
-                    self._platforms_forwarded = True
-                    return
-                else:
-                    _LOGGER.debug(f"{self._name}: deferred setup – inverter still not responding, will retry in {interval}s")
-            except Exception as ex:
-                _LOGGER.debug(f"{self._name}: deferred setup iteration failed: {ex}")
-            # Wait and try again
-            for _ in range(interval * 10):  # sleep in 0.1s steps to remain abortable
-                if getattr(self, "_stopping", False):
-                    return
-                await asyncio.sleep(0.1)
 
     # save and load local data entity values to make them persistent
     DATAFORMAT_VERSION = 1
@@ -1175,19 +1147,13 @@ class SolaXModbusHub:
         self._runtime_bisect_tasks.clear()
         # 2b) cancel init task if still running
         init_task = getattr(self, "_init_task", None)
-        if init_task and not init_task.done():
+        current_task = asyncio.current_task()
+        if init_task and init_task is not current_task and not init_task.done():
             try:
                 init_task.cancel()
             except Exception:
                 pass
-        # 2c) cancel deferred setup loop if scheduled
-        dtask = getattr(self, "_deferred_setup_task", None)
-        if dtask and not dtask.done():
-            try:
-                dtask.cancel()
-            except Exception:
-                pass
-        # 2d) cancel in-flight I/O tasks immediately and collect their
+        # 2c) cancel in-flight I/O tasks immediately and collect their
         # cancellation results so pymodbus shutdown exceptions do not leak.
         inflight_tasks = list(self._inflight_tasks)
         for task in inflight_tasks:
