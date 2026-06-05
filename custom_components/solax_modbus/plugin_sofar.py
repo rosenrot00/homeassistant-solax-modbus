@@ -212,6 +212,42 @@ def value_function_refluxcontrol(initval: Any, descr: Any, datadict: dict[str, A
     ]
 
 
+def value_function_active_power_control_mode(initval: Any, descr: Any, datadict: dict[str, Any]) -> str:
+    try:
+        raw_control = int(initval)
+    except (TypeError, ValueError):
+        raw_control = 0
+    datadict["active_power_control_raw"] = raw_control
+    return "Enabled" if raw_control & 0x1 else "Disabled"
+
+
+def value_function_active_power_control(initval: Any, descr: Any, datadict: dict[str, Any]) -> Any:
+    try:
+        control = int(datadict.get("active_power_control_raw", 0) or 0)
+    except (TypeError, ValueError):
+        control = 0
+
+    mode = datadict.get("active_power_control_mode", "Disabled")
+    if mode in (1, "1", "Enabled"):
+        control |= 0x1
+    else:
+        control &= ~0x1
+
+    limit_value = datadict.get("active_power_export_limit", 100)
+    if limit_value is None:
+        limit_value = 100
+    try:
+        limit_percent = float(limit_value)
+    except (TypeError, ValueError):
+        limit_percent = 100.0
+    limit_raw = int(round(max(0.0, min(100.0, limit_percent)) * 10))
+
+    return [
+        (REGISTER_U16, control),
+        (REGISTER_U16, limit_raw),
+    ]
+
+
 def value_function_epscontrol(initval: Any, descr: Any, datadict: dict[str, Any]) -> Any:
     return [
         (
@@ -335,6 +371,19 @@ BUTTON_TYPES = [
         ],
     ),
     SofarModbusButtonEntityDescription(
+        name="Active Power Control: Update",
+        key="active_power_control_update",
+        register=0x1105,
+        allowedtypes=HYBRID | PV | GEN,
+        write_method=WRITE_MULTI_MODBUS,
+        icon="mdi:solar-power-variant",
+        value_function=value_function_active_power_control,
+        depends_on=[
+            "active_power_control_mode",
+            "active_power_export_limit",
+        ],
+    ),
+    SofarModbusButtonEntityDescription(
         name="EPS: Update",
         key="eps_control_update",
         register=0x1029,
@@ -455,6 +504,21 @@ NUMBER_TYPES = [
         prevent_update=True,
         write_method=WRITE_DATA_LOCAL,
         icon="mdi:transmission-tower-import",
+    ),
+    SofarModbusNumberEntityDescription(
+        name="Active Power Export Limit",
+        key="active_power_export_limit",
+        register_data_type=REGISTER_U16,
+        fmt="i",
+        native_min_value=0,
+        native_max_value=100,
+        native_step=0.1,
+        native_unit_of_measurement=PERCENTAGE,
+        initvalue=100,
+        allowedtypes=HYBRID | PV | GEN,
+        prevent_update=True,
+        write_method=WRITE_DATA_LOCAL,
+        icon="mdi:solar-power-variant",
     ),
     SofarModbusNumberEntityDescription(
         name="EPS Wait Time",
@@ -583,6 +647,19 @@ SELECT_TYPES = [
         allowedtypes=HYBRID | PV,
         write_method=WRITE_DATA_LOCAL,
         icon="mdi:transmission-tower-import",
+    ),
+    SofarModbusSelectEntityDescription(
+        name="Active Power Control",
+        key="active_power_control_mode",
+        register_data_type=REGISTER_U16,
+        option_dict={
+            0: "Disabled",
+            1: "Enabled",
+        },
+        allowedtypes=HYBRID | PV | GEN,
+        write_method=WRITE_DATA_LOCAL,
+        initvalue=0,
+        icon="mdi:solar-power-variant",
     ),
     # TIMING AND TOU DISABLED AS THESE ARE NOT WORKING
     # SofarModbusSelectEntityDescription(
@@ -3564,6 +3641,26 @@ SENSOR_TYPES: list[SofarModbusSensorEntityDescription] = [
         },
         internal=True,
         allowedtypes=HYBRID | PV,
+    ),
+    SofarModbusSensorEntityDescription(
+        name="Active Power Control",
+        key="active_power_control_mode",
+        register=0x1105,
+        scale=value_function_active_power_control_mode,
+        entity_registry_enabled_default=False,
+        icon="mdi:solar-power-variant",
+        allowedtypes=HYBRID | PV | GEN,
+    ),
+    SofarModbusSensorEntityDescription(
+        name="Active Power Export Limit",
+        key="active_power_export_limit",
+        native_unit_of_measurement=PERCENTAGE,
+        register=0x1106,
+        scale=0.1,
+        rounding=1,
+        internal=True,
+        icon="mdi:solar-power-variant",
+        allowedtypes=HYBRID | PV | GEN,
     ),
     SofarModbusSensorEntityDescription(
         name="Charger Use Mode",
