@@ -416,17 +416,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                                     readFollowUp,
                                 )
 
-                            # Ensure existing Energy Dashboard entities are enabled before adding them.
-                            entity_registry = er.async_get(hass)
-                            for sensor_description in energy_dashboard_sensors:
-                                unique_id = f"{energy_dashboard_platform_name}_{sensor_description.key}"
-                                entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
-                                if entity_id:
-                                    maybe_entry = entity_registry.async_get(entity_id)
-                                    if maybe_entry is not None and maybe_entry.disabled_by:
-                                        _LOGGER.debug(f"{hub_name}: Enabling previously disabled Energy Dashboard entity: {entity_id}")
-                                        entity_registry.async_update_entity(entity_id, disabled_by=None)
-
                             # Add Energy Dashboard entities to main entities list and register them
                             if energy_dashboard_entities:
                                 _LOGGER.info(f"{hub_name}: Registering {len(energy_dashboard_entities)} Energy Dashboard entities")
