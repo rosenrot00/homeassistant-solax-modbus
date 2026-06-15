@@ -1021,9 +1021,10 @@ def entityToListSingle(
     if newdescr.sleepmode == SLEEPMODE_ZERO:
         hub.sleepzero.append(newdescr.key)
     if newdescr.register < 0:  # entity without modbus address
-        if newdescr.value_function and newdescr.internal:
+        enabled = is_entity_enabled(hub._hass, hub, newdescr, use_default=True, platform_name=hub_name)
+        if newdescr.value_function and (enabled or newdescr.internal):
             computedRegs[newdescr.key] = newdescr
-        elif not newdescr.value_function and is_entity_enabled(hub._hass, hub, newdescr, use_default=True, platform_name=hub_name):
+        elif not newdescr.value_function and enabled:
             _LOGGER.warning(f"{hub_name}: entity without modbus register address and without value_function found: {newdescr.key}")
     else:
         # target group
