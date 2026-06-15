@@ -20,6 +20,7 @@ from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
     CONF_PORT,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
     PERCENTAGE,
     Platform,
@@ -413,7 +414,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "hub": hub,
     }
 
-    await hub.async_init()
+    # Some systems fail to initialize Modbus reliably while HA is still
+    # starting. Defer startup initialization until HA reports it is running.
+    if hass.is_running:
+        await hub.async_init()
+    else:
+        async def _deferred_init(_event: Any) -> None:
+            if getattr(hub, "_stopping", False):
+                return
+            hub._init_task = hass.loop.create_task(hub.async_init())
+
+        entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _deferred_init))
 
     entry.async_on_unload(entry.add_update_listener(config_entry_update_listener))
     return True
@@ -615,16 +626,23 @@ class SolaXModbusHub:
         # Deferred setup state
         self._platforms_forwarded = False
         self._deferred_setup_task: Any = None
+        self._init_task: Any = None
 
         # _LOGGER.debug("solax modbushub done %s", self.__dict__)
 
     def _start_initial_refresh_if_needed(self) -> None:
         """Start the one-shot initial refresh after platforms are available."""
-        if self._initial_refresh_done or self._initial_refresh_task is not None:
+        if self._initial_refresh_done:
             return
+        if self._initial_refresh_task is not None:
+            if not self._initial_refresh_task.done():
+                return
+            self._initial_refresh_task = None
         if getattr(self, "_stopping", False):
             return
         if not self._platforms_forwarded:
+            return
+        if not self.groups:
             return
         self._initial_refresh_task = self._hass.loop.create_task(self._run_initial_refresh_when_ready())
 
@@ -972,6 +990,7 @@ class SolaXModbusHub:
         _LOGGER.debug(f"{self._name}: adding sensor {sensor.entity_description.key} available: {sensor._attr_available} ")
         grp.sensors.append(sensor)
         self.blocks_changed = True  # will force rebuild_blocks to be called
+        self._start_initial_refresh_if_needed()
 
     @callback
     async def async_remove_solax_modbus_sensor(self, sensor: Any) -> None:
@@ -1059,6 +1078,7 @@ class SolaXModbusHub:
         """Do a one-time initial refresh of all scan groups after startup probe has completed."""
         await self._probe_ready.wait()
         if getattr(self, "_stopping", False) or self._initial_refresh_done or not self.groups:
+            self._initial_refresh_task = None
             return
         # Let entity setup settle, then populate values once from slow to fast groups.
         await asyncio.sleep(0.2)
@@ -1076,6 +1096,7 @@ class SolaXModbusHub:
         finally:
             self._initial_refresh_active = False
             self._initial_refresh_done = True
+            self._initial_refresh_task = None
 
     async def _maybe_refresh_energy_dashboard_on_primary_update(self) -> None:
         if not self._hass:
