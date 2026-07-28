@@ -200,7 +200,7 @@ class SolaXModbusSelect(SelectEntity):
         elif self._write_method == WRITE_DATA_LOCAL:
             _LOGGER.info(f"*** local data written {self._key}: {payload}")
             self._hub.localsUpdated = True  # mark to save permanently
-        self._hub.data[self._key] = option
+        self._hub.record_control_write(self._key, option)
 
         # Handle autorepeat for selects with value_function (same pattern as buttons)
         if self.entity_description.value_function:

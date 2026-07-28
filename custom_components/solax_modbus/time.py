@@ -232,7 +232,7 @@ class SolaXModbusTimeEntity(TimeEntity):
             _LOGGER.info(f"*** local data written {self._key}: {time_str}")
             self._hub.localsUpdated = True  # mark to save permanently
 
-        self._hub.data[self._key] = time_str
+        self._hub.record_control_write(self._key, time_str)
         self._attr_native_value = value
         self.async_write_ha_state()
 

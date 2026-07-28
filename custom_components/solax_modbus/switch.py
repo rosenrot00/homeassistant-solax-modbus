@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -12,7 +11,6 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     CONF_MODBUS_ADDR,
-    DEBOUNCE_TIME,
     DEFAULT_MODBUS_ADDR,
     DOMAIN,
     WRITE_DATA_LOCAL,
@@ -127,7 +125,6 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
         self._attr_is_on = False
         self._bit = switch_info.register_bit if switch_info.register_bit is not None else 0
         self._value_function = switch_info.value_function
-        self._last_command_time: datetime | None = None  # Tracks last user action
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the switch on."""
@@ -140,8 +137,9 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
     async def _async_set_state(self, is_on: bool) -> None:
         """Write and publish a new state only after the write was accepted."""
         await self._write_switch_to_modbus(is_on)
+        if self._write_method != WRITE_DATA_LOCAL and self._sensor_key is not None:
+            self._hub.record_control_write(self._sensor_key, self._expected_readback(is_on))
         self._attr_is_on = is_on
-        self._last_command_time = datetime.now()  # Record user action time
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
@@ -158,7 +156,7 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
         is_on = last_state.state == "on"
         self._attr_is_on = is_on
         if self._sensor_key is not None:
-            self._hub.data[self._sensor_key] = 1 if is_on else 0
+            self._hub.record_control_write(self._sensor_key, self._expected_readback(is_on))
         self.async_write_ha_state()
 
     @callback
@@ -171,7 +169,7 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
         if self.entity_description.write_method == WRITE_DATA_LOCAL:
             if self._sensor_key is None:
                 return
-            self._hub.data[self._sensor_key] = 1 if is_on else 0
+            self._hub.record_control_write(self._sensor_key, self._expected_readback(is_on))
             self._hub.localsUpdated = True
             try:
                 self._hub._hass.bus.async_fire(
@@ -198,14 +196,23 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
             register_data_type=getattr(self.entity_description, "register_data_type", None),
         )
 
+    def _expected_readback(self, is_on: bool) -> int:
+        """Return the logical readback expected after a successful write."""
+        current_value = self._hub.data.get(self._sensor_key, 0)
+        try:
+            current_value = int(current_value)
+        except (TypeError, ValueError):
+            current_value = 0
+        return (current_value & ~(1 << self._bit)) | (int(is_on) << self._bit)
+
+    @callback
+    def modbus_data_updated(self) -> None:
+        """Publish a committed readback change."""
+        self.async_write_ha_state()
+
     @property
     def is_on(self) -> bool | None:
         """Return the state of the switch."""
-        # Prioritize user action within debounce time
-        if self._last_command_time and ((datetime.now() - self._last_command_time).total_seconds() < DEBOUNCE_TIME.total_seconds()):
-            return self._attr_is_on
-
-        # Otherwise, return the sensor state
         if self._sensor_key and (self._sensor_key in self._hub.data):
             sensvalue = self._hub.data.get(self._sensor_key, None)
             if sensvalue is not None:
@@ -218,6 +225,11 @@ class SolaXModbusSwitch(SwitchEntity, RestoreEntity):
             return bool(sensor_value & (1 << self._bit))
 
         return self._attr_is_on
+
+    @property
+    def should_poll(self) -> bool:
+        """Data is delivered by the hub."""
+        return False
 
     @property
     def name(self) -> str:

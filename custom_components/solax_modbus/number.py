@@ -275,6 +275,6 @@ class SolaXModbusNumber(NumberEntity):
                 self._hub.tmpdata_expiry[self.entity_description.key] = time() + TMPDATA_EXPIRY
                 # corresponding_sensor.async_write_ha_state()
             self._hub.localsUpdated = True  # mark to save permanently
-        self._hub.data[self._key] = value  # / self.entity_description.read_scale
+        self._hub.record_control_write(self._key, value)
         # _LOGGER.info(f"*** data written part 2 {self._key}: {self._hub.data[self._key]}")
         self.async_write_ha_state()  # is this needed ?

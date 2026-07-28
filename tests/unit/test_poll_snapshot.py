@@ -15,9 +15,11 @@ def make_hub() -> Any:
     hub = cast(Any, object.__new__(SolaXModbusHub))
     hub._name = "test"
     hub.data = {"_repeatUntil": {}, "raw": 1}
+    hub._control_write_revision = 0
     hub.computedSensors = {}
     hub.computedEntities = {}
     hub.sensorEntities = {}
+    hub.switchEntities = {}
     hub.writeLocals = {}
     hub.writequeue = {}
     hub.localsUpdated = False
@@ -167,11 +169,85 @@ def test_snapshot_commit_preserves_concurrent_local_change() -> None:
     new_data = {"_repeatUntil": {}, "raw": 2, "added": 7}
     hub.data = {"_repeatUntil": {}, "raw": 99, "removed": 5}
 
-    hub._commit_poll_snapshot(previous_data, new_data)
+    changed_keys = hub._commit_poll_snapshot(previous_data, new_data)
 
     assert hub.data["raw"] == 99
     assert hub.data["added"] == 7
     assert "removed" not in hub.data
+    assert changed_keys == {"added", "removed"}
+
+
+@pytest.mark.asyncio
+async def test_control_write_during_poll_discards_entire_snapshot() -> None:
+    """Do not publish raw or computed values built before an accepted write."""
+    hub = make_hub()
+    hub.data["control"] = 0
+    group = make_group()
+    hub.computedSensors["computed"] = SimpleNamespace(
+        key="computed",
+        internal=True,
+        value_function=lambda initval, descr, data: data["raw"] + data["control"],
+    )
+    write_recorded = False
+
+    async def read_block(data: dict[str, Any], block: Any, typ: str) -> bool:
+        nonlocal write_recorded
+        data["raw"] = block.start
+        if not write_recorded:
+            write_recorded = True
+            hub.record_control_write("control", 1)
+        return True
+
+    hub.async_read_modbus_block = read_block
+
+    result = await hub.async_read_modbus_registers_all(group)
+
+    assert result is True
+    assert hub.data["control"] == 1
+    assert hub.data["raw"] == 1
+    assert "computed" not in hub.data
+    assert group.publish_updates is False
+
+
+@pytest.mark.asyncio
+async def test_poll_started_after_write_can_reconcile_control_readback() -> None:
+    """The next non-overlapping poll remains authoritative for device state."""
+    hub = make_hub()
+    hub.data["control"] = 0
+    hub.record_control_write("control", 1)
+    group = make_group()
+
+    async def read_block(data: dict[str, Any], block: Any, typ: str) -> bool:
+        data["control"] = 0
+        return True
+
+    hub.async_read_modbus_block = read_block
+
+    result = await hub.async_read_modbus_registers_all(group)
+
+    assert result is True
+    assert hub.data["control"] == 0
+    assert group.publish_updates is True
+
+
+@pytest.mark.asyncio
+async def test_committed_readback_notifies_dependent_switch() -> None:
+    hub = make_hub()
+    switch = Mock()
+    switch.entity_description = SimpleNamespace(key="test_switch", sensor_key="raw")
+    hub.switchEntities["test_switch"] = switch
+    group = make_group()
+
+    async def read_block(data: dict[str, Any], block: Any, typ: str) -> bool:
+        data["raw"] = 2
+        return True
+
+    hub.async_read_modbus_block = read_block
+
+    result = await hub.async_read_modbus_registers_all(group)
+
+    assert result is True
+    switch.modbus_data_updated.assert_called_once_with()
 
 
 @pytest.mark.asyncio

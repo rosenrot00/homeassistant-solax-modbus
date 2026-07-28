@@ -82,6 +82,7 @@ from .const import (
     SCAN_GROUP_AUTO,
     SCAN_GROUP_DEFAULT,
     SLEEPMODE_LASTAWAKE,
+    WRITE_DATA_LOCAL,
     WRITE_MULTI_MODBUS,
     WRITE_SINGLE_MODBUS,
 )
@@ -559,6 +560,7 @@ class SolaXModbusHub:
         self._time_out = int(time_out)
         self.groups: dict[Any, Any] = {}  # group info, below
         self.data: dict[str, Any] = {"_repeatUntil": {}}  # _repeatuntil contains button autorepeat expiry times
+        self._control_write_revision = 0
         self.tmpdata: dict[Any, Any] = {}  # for WRITE_DATA_LOCAL entities with corresponding prevent_update number/sensor
         self.tmpdata_expiry: dict[Any, Any] = {}  # expiry timestamps for tempdata
         self.cyclecount: int = 0  # temporary - remove later
@@ -1346,7 +1348,7 @@ class SolaXModbusHub:
         return resp
 
     def _validate_write_response(self, response: Any, *, unit: int, address: int, operation: str) -> Any:
-        """Raise when pymodbus did not confirm a write operation."""
+        """Raise on rejected writes and invalidate polling started before accepted writes."""
         if response is None:
             raise HomeAssistantError(f"{self._name}: {operation} returned no response for device {unit} at register 0x{address:x}")
         try:
@@ -1357,6 +1359,7 @@ class SolaXModbusHub:
             ) from ex
         if is_error:
             raise HomeAssistantError(f"{self._name}: {operation} was rejected by device {unit} at register 0x{address:x}: {response}")
+        self._control_write_revision += 1
         return response
 
     def _encode_multi_write_payload(self, payload: list[tuple[Any, Any]]) -> list[int]:
@@ -1772,13 +1775,20 @@ class SolaXModbusHub:
                     )
                 return False
 
-    def _commit_poll_snapshot(self, previous_data: dict[str, Any], new_data: dict[str, Any]) -> None:
+    def record_control_write(self, key: str, value: Any) -> None:
+        """Publish an accepted control write and invalidate older poll snapshots."""
+        self._control_write_revision += 1
+        self.data[key] = value
+
+    def _commit_poll_snapshot(self, previous_data: dict[str, Any], new_data: dict[str, Any]) -> set[str]:
         """Commit polling changes without replacing the shared data dictionary."""
+        changed_keys: set[str] = set()
         missing = object()
 
         for key in previous_data.keys() - new_data.keys():
             if self.data.get(key, missing) == previous_data[key]:
                 self.data.pop(key, None)
+                changed_keys.add(key)
 
         for key, value in new_data.items():
             previous_value = previous_data.get(key, missing)
@@ -1788,6 +1798,22 @@ class SolaXModbusHub:
             current_value = self.data.get(key, missing)
             if current_value is missing or current_value == previous_value:
                 self.data[key] = value
+                changed_keys.add(key)
+
+        return changed_keys
+
+    def _publish_switch_readbacks(self, changed_keys: set[str]) -> None:
+        """Notify switches whose backing readback changed in a committed snapshot."""
+        if not changed_keys:
+            return
+
+        for switch in self.switchEntities.values():
+            if switch.entity_description.sensor_key not in changed_keys:
+                continue
+            try:
+                switch.modbus_data_updated()
+            except Exception:
+                _LOGGER.debug(f"{self._name}: cannot send readback update for switch {switch.entity_description.key}")
 
     async def async_read_modbus_registers_all(self, group: Any) -> bool:
         group.publish_updates = False
@@ -1799,6 +1825,7 @@ class SolaXModbusHub:
             _LOGGER.debug(f"{self._name}: device group inverter")
 
         previous_data = self.data.copy()
+        control_write_revision = self._control_write_revision
         data = previous_data.copy()
         res = True
         for block in group.holdingBlocks:
@@ -1821,8 +1848,8 @@ class SolaXModbusHub:
             local_callback_needed = local_callback_needed or self.localsLoaded
 
         # Local controls can change independently while a Modbus group is being read.
-        for key in self.writeLocals:
-            if key in self.data:
+        for key, descr in self.writeLocals.items():
+            if descr.write_method == WRITE_DATA_LOCAL and key in self.data:
                 data[key] = self.data[key]
 
         if res:
@@ -1837,19 +1864,23 @@ class SolaXModbusHub:
                     _LOGGER.warning(f"{self._name}: device group validation failed; discarding polling snapshot")
                     return True
 
-            self._commit_poll_snapshot(previous_data, data)
-            if local_callback_needed:
-                self.plugin.localDataCallback(self)
+            if self._control_write_revision != control_write_revision:
+                _LOGGER.debug(f"{self._name}: control write completed during poll; discarding superseded polling snapshot")
+            else:
+                changed_keys = self._commit_poll_snapshot(previous_data, data)
+                self._publish_switch_readbacks(changed_keys)
+                if local_callback_needed:
+                    self.plugin.localDataCallback(self)
 
-            for key, descr in list(self.computedSensors.items()):
-                sens = self.sensorEntities.get(key)
-                _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {self.data.get(descr.key)} ")
-                if sens and (not descr.internal):
-                    try:
-                        sens.modbus_data_updated()
-                    except Exception:
-                        _LOGGER.debug(f"{self._name}: cannot send update for {key} - probably disabled ")
-            group.publish_updates = True
+                for key, descr in list(self.computedSensors.items()):
+                    sens = self.sensorEntities.get(key)
+                    _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {self.data.get(descr.key)} ")
+                    if sens and (not descr.internal):
+                        try:
+                            sens.modbus_data_updated()
+                        except Exception:
+                            _LOGGER.debug(f"{self._name}: cannot send update for {key} - probably disabled ")
+                group.publish_updates = True
 
         if res and self.writequeue and self.plugin.isAwake(self.data):  # self.awakeplugin(self.data):
             # process outstanding write requests
