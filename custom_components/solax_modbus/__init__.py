@@ -620,13 +620,31 @@ class SolaXModbusHub:
 
     def _start_initial_refresh_if_needed(self) -> None:
         """Start the one-shot initial refresh after platforms are available."""
-        if self._initial_refresh_done or self._initial_refresh_task is not None:
+        if self._initial_refresh_done:
             return
+        if self._initial_refresh_task is not None:
+            if not self._initial_refresh_task.done():
+                return
+            self._initial_refresh_task = None
         if getattr(self, "_stopping", False):
             return
         if not self._platforms_forwarded:
             return
+        if not any(getattr(group, "device_groups", None) for group in self.groups.values()):
+            return
         self._initial_refresh_task = self._hass.loop.create_task(self._run_initial_refresh_when_ready())
+
+    async def _await_initial_refresh_if_started(self) -> None:
+        """Wait for the startup refresh before config entry setup completes."""
+        task = self._initial_refresh_task
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            _LOGGER.warning(f"{self._name}: initial refresh failed during setup: {ex}")
 
     async def async_init(self, *args: Any) -> None:  # noqa: D102
         import asyncio
@@ -702,15 +720,18 @@ class SolaXModbusHub:
                 self._platforms_forwarded = True
                 _LOGGER.debug(f"{self._name}: platforms forwarded successfully")
                 self._start_initial_refresh_if_needed()
+                await self._await_initial_refresh_if_started()
             except ValueError as ex:
                 # If platforms are already set up, log warning but continue
                 # This shouldn't happen if unload worked properly, but handle gracefully
                 _LOGGER.warning(f"{self._name}: platforms already forwarded - reload may not work correctly: {ex}")
                 self._platforms_forwarded = True
                 self._start_initial_refresh_if_needed()
+                await self._await_initial_refresh_if_started()
         else:
             _LOGGER.debug(f"{self._name}: platforms already forwarded on this hub instance, skipping")
             self._start_initial_refresh_if_needed()
+            await self._await_initial_refresh_if_started()
 
         self._init_task = None
 
@@ -750,6 +771,8 @@ class SolaXModbusHub:
                         return
                     await self._hass.config_entries.async_forward_entry_setups(self.entry, PLATFORMS)
                     self._platforms_forwarded = True
+                    self._start_initial_refresh_if_needed()
+                    await self._await_initial_refresh_if_started()
                     return
                 else:
                     _LOGGER.debug(f"{self._name}: deferred setup – inverter still not responding, will retry in {interval}s")
@@ -974,6 +997,7 @@ class SolaXModbusHub:
         _LOGGER.debug(f"{self._name}: adding sensor {sensor.entity_description.key} available: {sensor._attr_available} ")
         grp.sensors.append(sensor)
         self.blocks_changed = True  # will force rebuild_blocks to be called
+        self._start_initial_refresh_if_needed()
 
     @callback
     async def async_remove_solax_modbus_sensor(self, sensor: Any) -> None:
@@ -1027,7 +1051,12 @@ class SolaXModbusHub:
         # Return aggregate result and updated sensor count to caller for logging
         return agg_res, updated_sensors
 
-    async def _refresh_interval_group_once(self, interval_group: Any, bypass_slowdown: bool = False) -> tuple[bool, int]:
+    async def _refresh_interval_group_once(
+        self,
+        interval_group: Any,
+        bypass_slowdown: bool = False,
+        refresh_computed: bool = True,
+    ) -> tuple[bool, int]:
         """Refresh one interval group once."""
         if not interval_group.device_groups:
             return True, 0
@@ -1055,29 +1084,43 @@ class SolaXModbusHub:
                     for i in self.sleepzero:
                         self.data[i] = 0
                 _LOGGER.debug(f"{self._name}: device group read done")
+            if refresh_computed:
+                self._refresh_computed_sensor_states()
         return agg_res, updated_sensors
 
     async def _run_initial_refresh_when_ready(self) -> None:
         """Do a one-time initial refresh of all scan groups after startup probe has completed."""
         await self._probe_ready.wait()
-        if getattr(self, "_stopping", False) or self._initial_refresh_done or not self.groups:
+        if (
+            getattr(self, "_stopping", False)
+            or self._initial_refresh_done
+            or not any(getattr(group, "device_groups", None) for group in self.groups.values())
+        ):
+            self._initial_refresh_task = None
             return
-        # Let entity setup settle, then populate values once from slow to fast groups.
-        await asyncio.sleep(0.2)
         self._initial_refresh_active = True
         try:
+            refreshed = False
             for interval in sorted(self.groups.keys(), reverse=True):
                 interval_group = self.groups.get(interval)
                 if interval_group is None or not interval_group.device_groups:
                     continue
                 _LOGGER.debug(f"{self._name}: initial refresh for interval {interval}s")
                 async with interval_group.poll_lock:
-                    agg_res, updated_sensors = await self._refresh_interval_group_once(interval_group, bypass_slowdown=True)
+                    agg_res, updated_sensors = await self._refresh_interval_group_once(
+                        interval_group,
+                        bypass_slowdown=True,
+                        refresh_computed=False,
+                    )
+                refreshed = True
                 await self._maybe_refresh_energy_dashboard_on_primary_update()
                 _LOGGER.debug(f"{self._name}: initial refresh for interval {interval}s finished (ok={agg_res}, sensors={updated_sensors})")
+            if refreshed:
+                self._refresh_computed_sensor_states()
         finally:
             self._initial_refresh_active = False
             self._initial_refresh_done = True
+            self._initial_refresh_task = None
 
     async def _maybe_refresh_energy_dashboard_on_primary_update(self) -> None:
         if not self._hass:
@@ -1706,6 +1749,61 @@ class SolaXModbusHub:
                     )
                 return False
 
+    def _refresh_computed_sensor_states(self) -> None:
+        """Recompute and publish all active computed sensors."""
+        descriptions = dict(self.computedSensors)
+        computed: set[str] = set()
+        failed: set[str] = set()
+        visiting: set[str] = set()
+        publish_order: list[str] = []
+
+        def compute(key: str) -> bool:
+            if key in computed:
+                return True
+            if key in failed:
+                return False
+            if key in visiting:
+                _LOGGER.warning(f"{self._name}: circular computed sensor dependency involving {key}")
+                failed.add(key)
+                return False
+
+            descr = descriptions[key]
+            visiting.add(key)
+            for dependency in getattr(descr, "depends_on", None) or []:
+                if dependency in descriptions and not compute(dependency):
+                    _LOGGER.debug(f"{self._name}: cannot compute {key} because dependency {dependency} failed")
+                    failed.add(key)
+                    visiting.discard(key)
+                    return False
+            try:
+                self.data[key] = descr.value_function(0, descr, self.data)
+            except Exception as ex:
+                _LOGGER.debug(f"{self._name}: cannot compute value for {key}: {ex}")
+                failed.add(key)
+                visiting.discard(key)
+                return False
+            visiting.remove(key)
+            computed.add(key)
+            publish_order.append(key)
+            return True
+
+        for key in descriptions:
+            compute(key)
+
+        for key in publish_order:
+            descr = descriptions[key]
+            sens = self.sensorEntities.get(key)
+            _LOGGER.debug(f"{self._name}: updating computed sensor {sens} {key} {self.data.get(descr.key)}")
+            if sens is None or descr.internal:
+                continue
+            if getattr(sens, "hass", None) is None or getattr(sens, "entity_id", None) is None:
+                _LOGGER.debug(f"{self._name}: computed sensor {key} is not attached to Home Assistant yet")
+                continue
+            try:
+                sens.modbus_data_updated()
+            except Exception as ex:
+                _LOGGER.warning(f"{self._name}: cannot publish computed sensor {key}: {ex}")
+
     async def async_read_modbus_registers_all(self, group: Any) -> bool:
         if group.readPreparation is not None:
             if not await group.readPreparation(self.data):
@@ -1733,19 +1831,6 @@ class SolaXModbusHub:
             self.plugin.localDataCallback(self)
         if not self.localsLoaded:
             await self._hass.async_add_executor_job(self.loadLocalData)
-        for key, descr in list(self.computedSensors.items()):
-            try:
-                data[key] = descr.value_function(0, descr, data)
-            except Exception as ex:
-                _LOGGER.debug(f"{self._name}: cannot compute value for {key}: {ex}")
-                continue
-            sens = self.sensorEntities.get(key)
-            _LOGGER.debug(f"{self._name}: quickly updating state for computed sensor {sens} {key} {data.get(descr.key)} ")
-            if sens and (not descr.internal):
-                try:
-                    sens.modbus_data_updated()  # publish state to GUI and automations faster - assuming enabled, otherwise exception
-                except Exception:
-                    _LOGGER.debug(f"{self._name}: cannot send update for {key} - probably disabled ")
 
         if group.readFollowUp is not None:
             if not await group.readFollowUp(self.data, data):
@@ -1807,14 +1892,17 @@ class SolaXModbusHub:
 
     # --------------------------------------------- Check if sensor is a dependency -----------------------------------------------
 
-    def _is_dependency_for_enabled_control(self, sensor_key: str) -> bool:
-        """Check if a sensor is a required data source for any enabled control."""
+    def _is_dependency_for_enabled_control(self, sensor_key: str, visited: set[str] | None = None) -> bool:
+        """Check if a sensor is required by an enabled entity, including computed chains."""
+        if visited is None:
+            visited = set()
+        if sensor_key in visited:
+            return False
+        visited.add(sensor_key)
+
         control_keys = self.entity_dependencies.get(sensor_key, [])
         for control_key in control_keys:  # usually zero or one key
-            # This sensor is a dependency. Now, is the control that needs it enabled?
-            # We can reuse the logic from should_register_be_loaded, but we need to find the correct descriptor first.
             control_descr = None
-            # currently, a sensor can only have one associated control - is this comment still true???
             control_entity = self.selectEntities.get(control_key)
             if control_entity:
                 control_descr = control_entity.entity_description
@@ -1834,6 +1922,9 @@ class SolaXModbusHub:
                 control_descr = self.sensorDescriptions.get(control_key)
             if control_descr and should_register_be_loaded(self._hass, self, control_descr):
                 _LOGGER.debug(f"Sensor '{sensor_key}' is required by enabled control or value_function entity '{control_key}'.")
+                return True
+            if self._is_dependency_for_enabled_control(control_key, visited):
+                _LOGGER.debug(f"Sensor '{sensor_key}' is required through computed entity '{control_key}'.")
                 return True
         return False
 

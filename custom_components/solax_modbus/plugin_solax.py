@@ -9409,6 +9409,11 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         allowedtypes=AC | HYBRID | MIC,
+        depends_on=[
+            "inverter_power",
+            "measured_power",
+            "meter_2_measured_power",
+        ],
         icon="mdi:home-lightning-bolt",
     ),
     SolaXModbusSensorEntityDescription(
@@ -9419,6 +9424,11 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         allowedtypes=AC | HYBRID | GEN5 | GEN6 | X3,
+        depends_on=[
+            "inverter_power_l1",
+            "inverter_power_l2",
+            "inverter_power_l3",
+        ],
     ),
     SolaXModbusSensorEntityDescription(
         name="PV Power Total",
@@ -9469,6 +9479,9 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         entity_registry_enabled_default=False,
         depends_on=[
             "pv_power_total",
+            "battery_power_charge",
+            "measured_power",
+            "meter_2_measured_power",
         ],
         icon="mdi:home-lightning-bolt",
     ),
@@ -9536,6 +9549,10 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         modbus_max=99,
         value_function=value_function_battery_power_charge,
         allowedtypes=AC | HYBRID | GEN5 | GEN6,
+        depends_on=[
+            "battery_1_power_charge",
+            "battery_2_power_charge",
+        ],
         icon="mdi:battery-charging",
     ),
     #####
