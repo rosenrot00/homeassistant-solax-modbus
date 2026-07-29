@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from time import time
 from typing import Any
@@ -11312,6 +11312,326 @@ TIME_TYPES = [
 # ============================ plugin declaration =================================================
 
 
+SolaxInverterTypeFactory = Callable[[str], int]
+SolaxInverterModelFactory = Callable[[str], str]
+
+
+@dataclass(frozen=True, slots=True)
+class SolaxSerialPrefixRule:
+    """Map one or more serial prefixes to an inverter type and model."""
+
+    prefixes: tuple[str, ...]
+    inverter_type: int
+    inverter_model: str | None = None
+    inverter_type_factory: SolaxInverterTypeFactory | None = None
+    inverter_model_factory: SolaxInverterModelFactory | None = None
+
+    def identify(self, serial_number: str) -> tuple[int, str | None]:
+        """Return the inverter type and model for a matching serial number."""
+        inverter_type = self.inverter_type_factory(serial_number) if self.inverter_type_factory else self.inverter_type
+        inverter_model = self.inverter_model_factory(serial_number) if self.inverter_model_factory else self.inverter_model
+        return inverter_type, inverter_model
+
+
+def _x1_sk_model(serial_number: str) -> str:
+    suffix = "TL" if serial_number.startswith("L") else "SU"
+    return f"X1-Hybrid-{serial_number[1:2]}.{serial_number[2:3]}kW SK-{suffix}"
+
+
+def _x1_hybrid_gen3_model(serial_number: str) -> str:
+    return f"X1-Hybrid-{serial_number[3:4]}.{serial_number[4:5]}kW"
+
+
+def _x3_hybrid_gen3_early_model(serial_number: str) -> str:
+    return f"X3-Hybrid-{serial_number[3:5]}kW"
+
+
+def _x3_hybrid_gen3_model(serial_number: str) -> str:
+    return f"X3-Hybrid-{serial_number[4:6]}kW"
+
+
+def _x1_tigo_model(serial_number: str) -> str:
+    return f"X1-TIGO-TSI-{serial_number[3:4]}.{serial_number[4:5]}kW"
+
+
+def _x1_hybrid_gen4_model(serial_number: str) -> str:
+    return f"X1-Hybrid-{serial_number[2:3]}.{serial_number[3:4]}kW"
+
+
+def _x1_retrofit_gen4_model(serial_number: str) -> str:
+    return f"X1-RetroFit-{serial_number[2:3]}.{serial_number[3:4]}kW"
+
+
+def _x1_ies_model(serial_number: str) -> str:
+    return f"X1-IES-{serial_number[2:3]}.{serial_number[3:4]}kW"
+
+
+def _x1_vast_power(serial_number: str) -> int:
+    return int(serial_number[3:5], 16)
+
+
+def _x1_vast_type(serial_number: str) -> int:
+    inverter_type = HYBRID | GEN6 | X1
+    return inverter_type | (MPPT3 if _x1_vast_power(serial_number) < 8 else MPPT4)
+
+
+def _x1_vast_model(serial_number: str) -> str:
+    return f"X1-VAST-{_x1_vast_power(serial_number)}kW"
+
+
+def _x3_hybrid_gen4_model(serial_number: str) -> str:
+    return f"X3-Hybrid-{int(serial_number[4:6])}kW"
+
+
+def _x3_hybrid_83_model(serial_number: str) -> str:
+    return f"X3-Hybrid-{serial_number[4:5]}.{serial_number[5:6]}kW"
+
+
+def _x3_ies_small_model(serial_number: str) -> str:
+    return f"X3-IES-{serial_number[5:6]}kW"
+
+
+def _x3_ies_large_model(serial_number: str) -> str:
+    return f"X3-IES-{serial_number[4:6]}kW"
+
+
+def _x3_g4pro_power(serial_number: str) -> int:
+    return int(serial_number[3:5], 16)
+
+
+def _x3_g4pro_type(serial_number: str) -> int:
+    inverter_type = HYBRID | GEN6 | X3
+    if _x3_g4pro_power(serial_number) >= 8:
+        inverter_type |= MPPT3
+    return inverter_type
+
+
+def _x3_g4pro_model(serial_number: str) -> str:
+    return f"X3-G4PRO-{_x3_g4pro_power(serial_number)}kW"
+
+
+def _x3_mic_pro_power(serial_number: str) -> int:
+    return int(serial_number[3:5])
+
+
+def _x3_mic_pro_type(serial_number: str) -> int:
+    inverter_type = MIC | GEN2 | X3
+    if _x3_mic_pro_power(serial_number) >= 25:
+        inverter_type |= MPPT3
+    return inverter_type
+
+
+def _x3_mic_pro_model(serial_number: str) -> str:
+    return f"X3-MIC PRO-{_x3_mic_pro_power(serial_number)}kW"
+
+
+SOLAX_SERIAL_PREFIX_RULES = (
+    SolaxSerialPrefixRule(
+        ("L30", "U30", "L37", "U37", "L50", "U50"),
+        HYBRID | GEN2 | X1,
+        inverter_model_factory=_x1_sk_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H1E", "H1I", "HCC", "HUE", "XRE"),
+        HYBRID | GEN3 | X1,
+        inverter_model_factory=_x1_hybrid_gen3_model,
+    ),
+    SolaxSerialPrefixRule(("XAC",), AC | GEN3 | X1, "X1-AC"),
+    SolaxSerialPrefixRule(("PRI",), FIT | GEN3 | X1, "X1-FIT"),
+    SolaxSerialPrefixRule(
+        ("H3DE",),
+        HYBRID | GEN3 | X3,
+        inverter_model_factory=_x3_hybrid_gen3_early_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H3E", "H3LE", "H3PE", "H3UE"),
+        HYBRID | GEN3 | X3,
+        inverter_model_factory=_x3_hybrid_gen3_model,
+    ),
+    SolaxSerialPrefixRule(("F3D", "F3E"), AC | GEN3 | X3, "X3-RetroFit"),
+    SolaxSerialPrefixRule(
+        ("63150",),
+        HYBRID | GEN4 | X1,
+        inverter_model_factory=_x1_tigo_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H43", "H44", "H450", "H460", "H475"),
+        HYBRID | GEN4 | X1,
+        inverter_model_factory=_x1_hybrid_gen4_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("F43", "F450", "F460", "F475"),
+        AC | GEN4 | X1,
+        inverter_model_factory=_x1_retrofit_gen4_model,
+    ),
+    SolaxSerialPrefixRule(("PRE",), AC | GEN4 | X1, "X1-RetroFit"),
+    SolaxSerialPrefixRule(
+        ("H53",),
+        HYBRID | GEN5 | X1,
+        inverter_model_factory=_x1_ies_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H55", "H56", "H58"),
+        HYBRID | GEN5 | X1 | MPPT3,
+        inverter_model_factory=_x1_ies_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("10M",),
+        HYBRID | GEN6 | X1,
+        inverter_type_factory=_x1_vast_type,
+        inverter_model_factory=_x1_vast_model,
+    ),
+    SolaxSerialPrefixRule(("H31",), HYBRID | GEN4 | X3, "X3-TIGO TSI"),
+    SolaxSerialPrefixRule(
+        ("H34",),
+        HYBRID | GEN4 | X3,
+        inverter_model_factory=_x3_hybrid_gen4_model,
+    ),
+    # Preserve the existing X1 type flag for this serial family.
+    SolaxSerialPrefixRule(
+        ("H3VC83",),
+        HYBRID | GEN4 | X1,
+        inverter_model_factory=_x3_hybrid_83_model,
+    ),
+    SolaxSerialPrefixRule(("F34",), AC | GEN4 | X3, "X3-RetroFit"),
+    SolaxSerialPrefixRule(
+        ("H35A0", "P35A0", "H35F0"),
+        HYBRID | GEN5 | X3,
+        inverter_model_factory=_x3_ies_small_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H35A1", "P35A1", "H35F1"),
+        HYBRID | GEN5 | X3,
+        inverter_model_factory=_x3_ies_large_model,
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC15L", "H3BD15L", "H3BF15L", "H3BG15L"),
+        HYBRID | GEN5 | MPPT3 | X3,
+        "X3-Ultra-15kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC15", "H3BD15", "H3BF15", "H3BG15"),
+        HYBRID | GEN5 | X3,
+        "X3-Ultra-15kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC19", "H3BD19", "H3BF19", "H3BG19"),
+        HYBRID | GEN5 | X3,
+        "X3-Ultra-19.9kW",
+    ),
+    SolaxSerialPrefixRule(
+        (
+            "H3BC20L",
+            "H3BC20K",
+            "H3BD20L",
+            "H3BD20K",
+            "H3BF20L",
+            "H3BF20K",
+            "H3BG20L",
+            "H3BG20K",
+        ),
+        HYBRID | GEN5 | MPPT3 | X3,
+        "X3-Ultra-20kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC20", "H3BD20", "H3BF20", "H3BG20"),
+        HYBRID | GEN5 | X3,
+        "X3-Ultra-20kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC25", "H3BF25"),
+        HYBRID | GEN5 | MPPT3 | X3,
+        "X3-Ultra-25kW",
+    ),
+    # Preserve the existing 20 kW model labels for these 25-prefix variants.
+    SolaxSerialPrefixRule(
+        ("H3BD25", "H3BG25"),
+        HYBRID | GEN5 | MPPT3 | X3,
+        "X3-Ultra-20kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("H3BC30", "H3BD30", "H3BF30", "H3BG30"),
+        HYBRID | GEN5 | MPPT3 | X3,
+        "X3-Ultra-30kW",
+    ),
+    SolaxSerialPrefixRule(
+        ("10K",),
+        HYBRID | GEN6 | X3,
+        inverter_type_factory=_x3_g4pro_type,
+        inverter_model_factory=_x3_g4pro_model,
+    ),
+    SolaxSerialPrefixRule(("8021",), HYBRID | GEN5 | MPPT5 | X3, "X3-Aelio"),
+    SolaxSerialPrefixRule(("XAU", "XB3", "XBE", "XBU"), MIC | GEN2 | X1, "X1-Boost"),
+    SolaxSerialPrefixRule(("XAT", "XM3", "XMA"), MIC | GEN2 | X1, "X1-Mini"),
+    SolaxSerialPrefixRule(("XB4", "ZA4"), MIC | GEN4 | X1, "X1-Boost"),
+    SolaxSerialPrefixRule(("XM4",), MIC | GEN4 | X1, "X1-Mini"),
+    SolaxSerialPrefixRule(("XST",), MIC | GEN4 | X1 | MPPT3, "X1-SMART-G2"),
+    SolaxSerialPrefixRule(
+        (
+            "MC103T",
+            "MP153T",
+            "MC203T",
+            "MC402T",
+            "MC502T",
+            "MU502T",
+            "MC602T",
+            "MU602T",
+            "MC702T",
+            "MU702T",
+            "MC803T",
+            "MU803T",
+            "MU902T",
+            "MU103T",
+        ),
+        MIC | GEN | X3,
+        "X3-MIC",
+    ),
+    # Preserve the existing lack of a local model label for these serials.
+    SolaxSerialPrefixRule(("MC802T", "MCU08T", "MU802T"), MIC | GEN | X3),
+    SolaxSerialPrefixRule(
+        (
+            "MC806T",
+            "MU806T",
+            "MC106T",
+            "MC204T",
+            "MC205T",
+            "MC206T",
+            "MC208T",
+            "MC210T",
+            "MC212T",
+            "MC215T",
+            "MP156T",
+        ),
+        MIC | GEN2 | X3,
+        "X3-MIC",
+    ),
+    SolaxSerialPrefixRule(("PU",), MIC | GEN2 | X3, "X3-MIC Pro"),
+    SolaxSerialPrefixRule(
+        ("MPT",),
+        MIC | GEN2 | X3,
+        inverter_type_factory=_x3_mic_pro_type,
+        inverter_model_factory=_x3_mic_pro_model,
+    ),
+    SolaxSerialPrefixRule(("MAX",), MAX, "X3-MAX"),
+)
+
+_SOLAX_SERIAL_PREFIX_MATCHERS = tuple(
+    sorted(
+        ((prefix, rule) for rule in SOLAX_SERIAL_PREFIX_RULES for prefix in rule.prefixes),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+
+def identify_solax_inverter(serial_number: str) -> tuple[int, str | None] | None:
+    """Identify a SolaX inverter from its serial number."""
+    for prefix, rule in _SOLAX_SERIAL_PREFIX_MATCHERS:
+        if serial_number.startswith(prefix):
+            return rule.identify(serial_number)
+    return None
+
+
 @dataclass(kw_only=True)
 class solax_plugin(plugin_base):
     def isAwake(self, datadict: dict[str, Any]) -> bool:
@@ -11335,385 +11655,12 @@ class solax_plugin(plugin_base):
             _LOGGER.error(f"{hub.name}: cannot find any serial number(s)")
             seriesnumber = "unknown"
 
-        # derive invertertupe from seriiesnumber
-        if seriesnumber.startswith("L30"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-TL 3kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-TL"
-        elif seriesnumber.startswith("U30"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-SU 3kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-SU"
-        elif seriesnumber.startswith("L37"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-TL 3.7kW Untested
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-TL"
-        elif seriesnumber.startswith("U37"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-SU 3.7kW Untested
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-SU"
-        elif seriesnumber.startswith("L50"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-TL 5kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-TL"
-        elif seriesnumber.startswith("U50"):
-            invertertype = HYBRID | GEN2 | X1  # Gen2 X1 SK-SU 5kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[1:2]}.{seriesnumber[2:3]}kW SK-SU"
-        elif seriesnumber.startswith("H1E"):
-            invertertype = HYBRID | GEN3 | X1  # Gen3 X1 Early
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("H1I"):
-            invertertype = HYBRID | GEN3 | X1  # Gen3 X1 Alternative
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("HCC"):
-            invertertype = HYBRID | GEN3 | X1  # Gen3 X1 Alternative
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("HUE"):
-            invertertype = HYBRID | GEN3 | X1  # Gen3 X1 Late
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("XRE"):
-            invertertype = HYBRID | GEN3 | X1  # Gen3 X1 Alternative
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("XAC"):
-            invertertype = AC | GEN3 | X1  # X1AC
-            self.inverter_model = "X1-AC"
-        elif seriesnumber.startswith("PRI"):
-            invertertype = FIT | GEN3 | X1  # X1-FIT GEN3: AC hardware, uses Hybrid register layout for some registers
-            self.inverter_model = "X1-FIT"
-        elif seriesnumber.startswith("H3DE"):
-            invertertype = HYBRID | GEN3 | X3  # Gen3 X3
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[3:5]}kW"
-        elif seriesnumber.startswith("H3E"):
-            invertertype = HYBRID | GEN3 | X3  # Gen3 X3
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("H3LE"):
-            invertertype = HYBRID | GEN3 | X3  # Gen3 X3
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("H3PE"):
-            invertertype = HYBRID | GEN3 | X3  # Gen3 X3
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("H3UE"):
-            invertertype = HYBRID | GEN3 | X3  # Gen3 X3
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("F3D"):
-            invertertype = AC | GEN3 | X3  # RetroFit
-            self.inverter_model = "X3-RetroFit"
-        elif seriesnumber.startswith("F3E"):
-            invertertype = AC | GEN3 | X3  # RetroFit
-            self.inverter_model = "X3-RetroFit"
-        elif seriesnumber.startswith("63150"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 5.0kW
-            self.inverter_model = f"X1-TIGO-TSI-{seriesnumber[3:4]}.{seriesnumber[4:5]}kW"
-        elif seriesnumber.startswith("H43"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 3kW / 3.7kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H44"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 alt 5kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H450"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 5.0kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H460"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 6kW?
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H475"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 X1 7.5kW
-            self.inverter_model = f"X1-Hybrid-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("F43"):
-            invertertype = AC | GEN4 | X1  # RetroFit X1 3kW / 3.7kW?
-            self.inverter_model = f"X1-RetroFit-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("F450"):
-            invertertype = AC | GEN4 | X1  # RetroFit 5kW
-            self.inverter_model = f"X1-RetroFit-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("F460"):
-            invertertype = AC | GEN4 | X1  # RetroFit X1 6kW?
-            self.inverter_model = f"X1-RetroFit-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("F475"):
-            invertertype = AC | GEN4 | X1  # RetroFit X1 7.5kW?
-            self.inverter_model = f"X1-RetroFit-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("PRE"):
-            invertertype = AC | GEN4 | X1  # RetroFit
-            self.inverter_model = "X1-RetroFit"
-        elif seriesnumber.startswith("H53"):
-            invertertype = HYBRID | GEN5 | X1  # X1-IES 3.7kW?
-            self.inverter_model = f"X1-IES-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H55"):
-            invertertype = HYBRID | GEN5 | X1 | MPPT3  # X1-IES 5kW?
-            self.inverter_model = f"X1-IES-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H56"):
-            invertertype = HYBRID | GEN5 | X1 | MPPT3  # X1-IES 6kW?
-            self.inverter_model = f"X1-IES-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("H58"):
-            invertertype = HYBRID | GEN5 | X1 | MPPT3  # X1-IES 8kW
-            self.inverter_model = f"X1-IES-{seriesnumber[2:3]}.{seriesnumber[3:4]}kW"
-        elif seriesnumber.startswith("10M"):
-            kw_value = int(seriesnumber[3:5], 16)
-            invertertype = HYBRID | GEN6 | X1
-            if kw_value < 8:
-                invertertype |= MPPT3
-            else:
-                invertertype |= MPPT4
-            self.inverter_model = f"X1-VAST-{kw_value}kW"  # datasheet name X1-VAST-6K
-        elif seriesnumber.startswith("H31"):
-            invertertype = HYBRID | GEN4 | X3  # TIGO TSI X3
-            self.inverter_model = "X3-TIGO TSI"
-        elif seriesnumber.startswith("H34"):
-            invertertype = HYBRID | GEN4 | X3  # Gen4 X3 5-15kW
-            self.inverter_model = f"X3-Hybrid-{int(seriesnumber[4:6])}kW"
-        elif seriesnumber.startswith("H3VC83"):
-            invertertype = HYBRID | GEN4 | X1  # Gen4 8.3kW
-            self.inverter_model = f"X3-Hybrid-{seriesnumber[4:5]}.{seriesnumber[5:6]}kW"
-        elif seriesnumber.startswith("F34"):
-            invertertype = AC | GEN4 | X3  # Gen4 X3 FIT
-            self.inverter_model = "X3-RetroFit"
-        elif seriesnumber.startswith("H35A0"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 4-8kW A
-            self.inverter_model = f"X3-IES-{seriesnumber[5:6]}kW"
-        elif seriesnumber.startswith("H35A1"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 10-15kW A
-            self.inverter_model = f"X3-IES-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("P35A0"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 4-8kW P
-            self.inverter_model = f"X3-IES-{seriesnumber[5:6]}kW"
-        elif seriesnumber.startswith("P35A1"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 10-15kW P
-            self.inverter_model = f"X3-IES-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("H35F0"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 4-8kW F
-            self.inverter_model = f"X3-IES-{seriesnumber[5:6]}kW"
-        elif seriesnumber.startswith("H35F1"):
-            invertertype = HYBRID | GEN5 | X3  # X3-IES 10-15kW F
-            self.inverter_model = f"X3-IES-{seriesnumber[4:6]}kW"
-        elif seriesnumber.startswith("H3BC15L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 15KP C #1668
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BC15"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra C
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BC19"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra C
-            self.inverter_model = "X3-Ultra-19.9kW"
-        elif seriesnumber.startswith("H3BC20L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP C
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BC20K"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP C #1668
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BC20"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra C
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BC25"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra C
-            self.inverter_model = "X3-Ultra-25kW"
-        elif seriesnumber.startswith("H3BC30"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra C
-            self.inverter_model = "X3-Ultra-30kW"
-        elif seriesnumber.startswith("H3BD15L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 15KP D #1668
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BD15"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra D
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BD19"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra D
-            self.inverter_model = "X3-Ultra-19.9kW"
-        elif seriesnumber.startswith("H3BD20L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP D
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BD20K"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP D #1668
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BD20"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra D
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BD25"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra D
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BD30"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra D
-            self.inverter_model = "X3-Ultra-30kW"
-        elif seriesnumber.startswith("H3BF15L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 15KP F #1668
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BF15"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra F
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BF19"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra F
-            self.inverter_model = "X3-Ultra-19.9kW"
-        elif seriesnumber.startswith("H3BF20L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP F
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BF20K"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP F #1668
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BF20"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra F
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BF25"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra F
-            self.inverter_model = "X3-Ultra-25kW"
-        elif seriesnumber.startswith("H3BF30"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra F
-            self.inverter_model = "X3-Ultra-30kW"
-        elif seriesnumber.startswith("H3BG15L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 15KP G #1668
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BG15"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra G
-            self.inverter_model = "X3-Ultra-15kW"
-        elif seriesnumber.startswith("H3BG19"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra G
-            self.inverter_model = "X3-Ultra-19.9kW"
-        elif seriesnumber.startswith("H3BG20L"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP G
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BG20K"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra 20KP G #1668
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BG20"):
-            invertertype = HYBRID | GEN5 | X3  # X3 Ultra G
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BG25"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra G
-            self.inverter_model = "X3-Ultra-20kW"
-        elif seriesnumber.startswith("H3BG30"):
-            invertertype = HYBRID | GEN5 | MPPT3 | X3  # X3 Ultra G
-            self.inverter_model = "X3-Ultra-30kW"
-        elif seriesnumber.startswith("10K"):
-            kw_value = int(seriesnumber[3:5], 16)
-            invertertype = HYBRID | GEN6 | X3  # X3-HYB-G4 PRO
-            if kw_value >= 8:
-                invertertype |= MPPT3
-            self.inverter_model = f"X3-G4PRO-{kw_value}kW"  # datasheet name X3-HYB-4.0-P
-        elif seriesnumber.startswith("8021"):
-            invertertype = HYBRID | GEN5 | MPPT5 | X3  # X3-Aelio #1555, Contains 5 or 6 MPPT depending on size
-            self.inverter_model = "X3-Aelio"
-        elif seriesnumber.startswith("XAU"):
-            invertertype = MIC | GEN2 | X1  # X1-Boost
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XB3"):
-            invertertype = MIC | GEN2 | X1  # X1-Boost
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XBE"):
-            invertertype = MIC | GEN2 | X1  # X1-Boost
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XBU"):
-            invertertype = MIC | GEN2 | X1  # X1-Boost
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XAT"):
-            invertertype = MIC | GEN2 | X1  # X1-Mini G3 #1340
-            self.inverter_model = "X1-Mini"
-        elif seriesnumber.startswith("XM3"):
-            invertertype = MIC | GEN2 | X1  # X1-Mini G3
-            self.inverter_model = "X1-Mini"
-        elif seriesnumber.startswith("XB4"):
-            invertertype = MIC | GEN4 | X1  # X1-Boost G4
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XM4"):
-            invertertype = MIC | GEN4 | X1  # X1-Mini G4
-            self.inverter_model = "X1-Mini"
-        elif seriesnumber.startswith("XMA"):
-            invertertype = MIC | GEN2 | X1  # X1-Mini G3
-            self.inverter_model = "X1-Mini"
-        elif seriesnumber.startswith("ZA4"):
-            invertertype = MIC | GEN4 | X1  # X1-Boost G4
-            self.inverter_model = "X1-Boost"
-        elif seriesnumber.startswith("XST"):
-            invertertype = MIC | GEN4 | X1 | MPPT3  # X1-SMART-G2
-            self.inverter_model = "X1-SMART-G2"
-        elif seriesnumber.startswith("MC103T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MP153T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC203T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC402T"):
-            invertertype = MIC | GEN | X3  # MIC X3 #1339
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC502T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU502T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC602T"):
-            invertertype = MIC | GEN | X3  # MIC X3 6kW
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU602T"):
-            invertertype = MIC | GEN | X3  # MIC X3 6kW
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC702T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU702T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC802T"):
-            invertertype = MIC | GEN | X3  # MIC X3 8kW
-        elif seriesnumber.startswith("MCU08T"):
-            invertertype = MIC | GEN | X3  # MIC X3 8kW
-        elif seriesnumber.startswith("MU802T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-        elif seriesnumber.startswith("MC803T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU803T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU902T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU103T"):
-            invertertype = MIC | GEN | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC806T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MU806T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC106T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC204T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC205T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC206T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC208T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC210T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC212T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MC215T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("MP156T"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC"
-        elif seriesnumber.startswith("PU"):
-            invertertype = MIC | GEN2 | X3  # MIC X3
-            self.inverter_model = "X3-MIC Pro"
-        elif seriesnumber.startswith("MPT"):
-            kw_value = int(seriesnumber[3:5])
-            invertertype = MIC | GEN2 | X3
-            if kw_value >= 25:
-                invertertype |= MPPT3
-            self.inverter_model = f"X3-MIC PRO-{kw_value}kW"  # datasheet name X3-MIC-3K-G2
-        elif seriesnumber.startswith("MAX"):
-            invertertype = MAX  # MAX G1
-            self.inverter_model = "X3-MAX"
-        else:
+        identification = identify_solax_inverter(seriesnumber)
+        if identification is None:
             invertertype = 0
             _LOGGER.error(f"unrecognized inverter type - serial number : {seriesnumber}")
-
+        else:
+            invertertype, self.inverter_model = identification
         hub.inverter_model = self.inverter_model if invertertype > 0 else None
         hub._has_local_inverter_model = True
 
