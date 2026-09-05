@@ -1,3 +1,5 @@
+import pytest
+
 from custom_components.solax_modbus.const import REG_HOLDING, REG_INPUT
 from custom_components.solax_modbus.plugin_growatt import (
     SENSOR_TYPES,
@@ -20,7 +22,8 @@ def _matching_module1_descriptions(serial_number: str) -> dict[str, GrowattModbu
     return descriptions
 
 
-def test_dlp_bms1_module1_uses_apx_input_registers() -> None:
+@pytest.mark.parametrize("serial_number", ["DLP1234567", "TSS0F4L1234"])
+def test_apx_bms1_module1_uses_input_registers(serial_number: str) -> None:
     expected_input_registers = {
         "bms_1_module_1_status": 5080,
         "bms_1_module_1_soh": 5082,
@@ -33,7 +36,7 @@ def test_dlp_bms1_module1_uses_apx_input_registers() -> None:
         "bms_1_module_1_warning_text": 5098,
         "bms_1_module_1_charge_cycles": 5108,
     }
-    descriptions = _matching_module1_descriptions("DLP1234567")
+    descriptions = _matching_module1_descriptions(serial_number)
 
     for key, register in expected_input_registers.items():
         description = descriptions[key]
@@ -41,7 +44,8 @@ def test_dlp_bms1_module1_uses_apx_input_registers() -> None:
         assert description.register_type == REG_INPUT
 
 
-def test_jcm_bms1_module1_keeps_holding_registers() -> None:
+@pytest.mark.parametrize("serial_number", ["JCM0D12345", "TTS1234567", "DKS1234567"])
+def test_other_models_bms1_module1_keep_holding_registers(serial_number: str) -> None:
     expected_holding_registers = {
         "bms_1_module_1_status": 5880,
         "bms_1_module_1_soh": 5882,
@@ -54,7 +58,7 @@ def test_jcm_bms1_module1_keeps_holding_registers() -> None:
         "bms_1_module_1_warning_text": 5898,
         "bms_1_module_1_charge_cycles": 5908,
     }
-    descriptions = _matching_module1_descriptions("JCM0D12345")
+    descriptions = _matching_module1_descriptions(serial_number)
 
     for key, register in expected_holding_registers.items():
         description = descriptions[key]

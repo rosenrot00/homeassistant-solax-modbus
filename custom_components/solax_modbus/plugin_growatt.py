@@ -94,11 +94,11 @@ MPPT8 = 0x200000
 MPPT10 = 0x400000
 ALL_MPPT_GROUP = MPPT3 | MPPT4 | MPPT6 | MPPT8 | MPPT10
 
-# DLP MID 30KTL3-XH units expose BMS1 module 1 through the APX input-register block.
+# Select the APX input-register block for BMS1 module 1 on DLP and TSS units.
 APX_BMS_INPUT = 0x800000
 ALL_APX_BMS_REGISTER_GROUP = APX_BMS_INPUT
 
-APX_BMS_INPUT_SERIAL_PREFIXES = ["DLP"]
+APX_BMS_INPUT_SERIAL_PREFIXES = ["DLP", "TSS"]
 
 ALLDEFAULT = 0  # should be equivalent to HYBRID | AC | GEN | GEN2 | GEN3 | GEN4 | X1 | X3
 
@@ -9219,7 +9219,7 @@ APX_BMS1_MODULE1_INPUT_REGISTERS = {
 }
 
 # Keep the established 588x holding-register descriptions for other Growatt models,
-# and create a DLP-only 508x input-register variant from the same metadata.
+# and create a 508x input-register variant for APX_BMS_INPUT models from the same metadata.
 SENSOR_TYPES.extend(
     replace(
         description,
@@ -9730,7 +9730,7 @@ SERIAL_PREFIX_TYPES = {
     "DKS": HYBRID | GEN4 | X3 | MPPT3,  # MOD 10000 TL3-HU Hybrid, 3 MPPT
     "DO1": HYBRID | GEN4 | X3 | MPPT3,  # MOD 12000 TL3-HU Hybrid, 3 MPPT
     "TTS": HYBRID | GEN4 | X3 | MPPT3,  # Hybrid KTL3-HU 12kW
-    "TSS": HYBRID | GEN4 | X3 | MPPT3,  # Hybrid KTL3-HU 12kW
+    "TSS": HYBRID | GEN4 | X3 | MPPT3 | APX_BMS_INPUT,  # Hybrid KTL3-HU 12kW
     "PYL": HYBRID | GEN4 | X3,  # MOD 5000 TL3-XH Hybrid, 2 MPPT
     "JCM": HYBRID | GEN4 | X3,  # MOD 6000 TL3-XH Hybrid, 2 MPPT
     "MEK": HYBRID | GEN4 | X3,  # MOD 7000 TL3-XH Hybrid, 2 MPPT
