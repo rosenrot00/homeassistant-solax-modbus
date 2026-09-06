@@ -1,6 +1,7 @@
 """Tests for SOFAR battery-pack selection."""
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -94,13 +95,11 @@ async def test_end_validation_contains_read_failures(response: Any, message: str
 @pytest.mark.parametrize(
     ("selection", "new_data", "registered_serials", "message"),
     [
-        (0, {"b1_pack_serial_number": "PACK-1"}, {0: {1: "PACK-1"}}, "expected 0x0100, actual selection 0x0000"),
+        (0, {"b1_pack_serial_number": "PACK-2"}, {0: {1: "PACK-1"}}, "expected 0x0100, actual selection 0x0000"),
         (0x0100, {}, {0: {1: "PACK-1"}}, "missing serial number (b1_pack_serial_number)"),
         (0x0100, {"b1_pack_serial_number": None}, {0: {1: "PACK-1"}}, "missing serial number"),
-        (0x0100, {"b1_pack_serial_number": "PACK-2"}, {0: {1: "PACK-1"}}, "serial number mismatch"),
-        (0x0100, {"b1_pack_serial_number": "PACK-1"}, {}, "no registered serial number"),
     ],
-    ids=["wrong-pack", "missing-serial", "null-serial", "wrong-serial", "unregistered-pack"],
+    ids=["wrong-pack", "missing-serial", "null-serial"],
 )
 async def test_end_validation_reports_rejection_reason(
     selection: int,
@@ -110,13 +109,28 @@ async def test_end_validation_reports_rejection_reason(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Keep pack identity checks and explain which one failed."""
-    config = battery_config(batt_pack_serials=registered_serials)
+    config = battery_config(batt_pack_serials=deepcopy(registered_serials))
     hub = make_hub(selection)
 
     assert await config.check_battery_on_end(hub, {}, new_data, "b1_", 0, 1) is False
 
     assert "BMS validation after reading failed for battery 0 pack 1" in caplog.text
     assert message in caplog.text
+    assert config.batt_pack_serials == registered_serials
+    hub.async_write_registers_single.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered_serials", [{0: {1: "OLD-PACK"}}, {}], ids=["replaced-pack", "unregistered-pack"])
+async def test_valid_selection_refreshes_serial_metadata(registered_serials: dict[int, dict[int, str]]) -> None:
+    """Old or absent device metadata must not block a correctly selected pack."""
+    config = battery_config(batt_pack_serials=registered_serials)
+    hub = make_hub(0x0100, 0x0100)
+
+    assert await config.check_battery_on_start(hub, {}, "b1_", 0, 1) is True
+    assert await config.check_battery_on_end(hub, {}, {"b1_pack_serial_number": "NEW-PACK"}, "b1_", 0, 1) is True
+    assert await config.get_batt_pack_serial(hub, 0, 1) == "NEW-PACK"
+    assert hub.async_read_holding_registers.await_count == 2
     hub.async_write_registers_single.assert_not_awaited()
 
 

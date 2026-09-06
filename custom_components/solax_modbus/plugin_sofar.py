@@ -4224,11 +4224,6 @@ class battery_config(base_battery_config):
         return f"BMS: V{new_data[sw_version_key]}"
 
     async def check_battery_on_start(self, hub: Any, old_data: dict[str, Any], key_prefix: str, batt_nr: int, batt_pack_nr: int) -> bool:
-        if not self.batt_pack_serials.__contains__(batt_nr):
-            return False
-        if not self.batt_pack_serials[batt_nr].__contains__(batt_pack_nr):
-            return False
-
         faulty_nr = 0
         payload = faulty_nr << 12 | batt_pack_nr << 8 | batt_nr
         for _retry in range(0, 10):
@@ -4272,13 +4267,9 @@ class battery_config(base_battery_config):
                 "BMS validation after reading failed for battery %s pack %s: missing serial number (%s)", batt_nr, batt_pack_nr, serial_key
             )
             return False
-        expected_serial = self.batt_pack_serials.get(batt_nr, {}).get(batt_pack_nr)
-        if not expected_serial:
-            _LOGGER.warning("BMS validation after reading failed for battery %s pack %s: no registered serial number", batt_nr, batt_pack_nr)
-            return False
-        if serial != expected_serial:
-            _LOGGER.warning("BMS validation after reading failed for battery %s pack %s: serial number mismatch", batt_nr, batt_pack_nr)
-            return False
+        # Selection identifies the requested pack. A stored serial is device metadata,
+        # not a permanent validation constraint (packs can be replaced or reordered).
+        self.batt_pack_serials.setdefault(batt_nr, {})[batt_pack_nr] = serial
         return True
 
     async def _determine_bat_quantitys(self, hub: Any) -> None:
