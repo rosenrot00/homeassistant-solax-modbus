@@ -96,7 +96,9 @@ ALL_MPPT_GROUP = MPPT3 | MPPT4 | MPPT6 | MPPT8 | MPPT10
 
 # Select the APX input-register block for BMS1 module 1 on DLP and TSS units.
 APX_BMS_INPUT = 0x800000
-ALL_APX_BMS_REGISTER_GROUP = APX_BMS_INPUT
+# TSS units use the BDC1 input block for the aggregate battery sensors.
+TSS_BMS_INPUT = 0x1000000
+ALL_APX_BMS_REGISTER_GROUP = APX_BMS_INPUT | TSS_BMS_INPUT
 
 APX_BMS_INPUT_SERIAL_PREFIXES = ["DLP", "TSS"]
 
@@ -6673,6 +6675,7 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
         register=5769,  # maybe 5768 and U32
+        blacklist=["TSS"],
         register_type=REG_INPUT,
         register_data_type=REGISTER_U16,  ## maybe U32 if reg is 5768
         scale=0.1,
@@ -6687,6 +6690,7 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         register=5777,
+        blacklist=["TSS"],
         register_type=REG_INPUT,
         register_data_type=REGISTER_U16,
         allowedtypes=GEN4 | HYBRID,
@@ -6700,6 +6704,7 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         register=5778,
+        blacklist=["TSS"],
         register_type=REG_INPUT,
         register_data_type=REGISTER_U16,
         allowedtypes=GEN4 | HYBRID,
@@ -9205,6 +9210,28 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
     ),
 ]
 
+# Protocol II V1.39: BDC1 input 4008-4076 mirrors input 3165-3233.
+# BMS_SOC (3215) -> 4058; BMS_SOH (3222) -> 4065;
+# Edischr_total H/L (3182/3183) -> 4025/4026, unsigned 32-bit, 0.1 kWh.
+# Keep this mapping scoped to TSS while it is being verified on MOD KTL3-HU.
+TSS_BMS1_INPUT_REGISTERS = {
+    "bms_1_soc": (4058, REGISTER_U16),
+    "bms_1_soh": (4065, REGISTER_U16),
+    "bms_1_toe": (4025, REGISTER_U32),
+}
+
+SENSOR_TYPES.extend(
+    replace(
+        description,
+        register=TSS_BMS1_INPUT_REGISTERS[description.key][0],
+        register_data_type=TSS_BMS1_INPUT_REGISTERS[description.key][1],
+        allowedtypes=description.allowedtypes | TSS_BMS_INPUT,
+        blacklist=None,
+    )
+    for description in tuple(SENSOR_TYPES)
+    if description.key in TSS_BMS1_INPUT_REGISTERS
+)
+
 APX_BMS1_MODULE1_INPUT_REGISTERS = {
     "bms_1_module_1_status": 5080,
     "bms_1_module_1_soh": 5082,
@@ -9730,7 +9757,7 @@ SERIAL_PREFIX_TYPES = {
     "DKS": HYBRID | GEN4 | X3 | MPPT3,  # MOD 10000 TL3-HU Hybrid, 3 MPPT
     "DO1": HYBRID | GEN4 | X3 | MPPT3,  # MOD 12000 TL3-HU Hybrid, 3 MPPT
     "TTS": HYBRID | GEN4 | X3 | MPPT3,  # Hybrid KTL3-HU 12kW
-    "TSS": HYBRID | GEN4 | X3 | MPPT3 | APX_BMS_INPUT,  # Hybrid KTL3-HU 12kW
+    "TSS": HYBRID | GEN4 | X3 | MPPT3 | APX_BMS_INPUT | TSS_BMS_INPUT,  # Hybrid KTL3-HU 12kW
     "PYL": HYBRID | GEN4 | X3,  # MOD 5000 TL3-XH Hybrid, 2 MPPT
     "JCM": HYBRID | GEN4 | X3,  # MOD 6000 TL3-XH Hybrid, 2 MPPT
     "MEK": HYBRID | GEN4 | X3,  # MOD 7000 TL3-XH Hybrid, 2 MPPT

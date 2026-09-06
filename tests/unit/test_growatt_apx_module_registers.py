@@ -1,6 +1,6 @@
 import pytest
 
-from custom_components.solax_modbus.const import REG_HOLDING, REG_INPUT
+from custom_components.solax_modbus.const import REG_HOLDING, REG_INPUT, REGISTER_U16, REGISTER_U32
 from custom_components.solax_modbus.plugin_growatt import (
     SENSOR_TYPES,
     SERIAL_PREFIX_TYPES,
@@ -64,3 +64,33 @@ def test_other_models_bms1_module1_keep_holding_registers(serial_number: str) ->
         description = descriptions[key]
         assert description.register == register
         assert description.register_type == REG_HOLDING
+
+
+@pytest.mark.parametrize("prefix", list(SERIAL_PREFIX_TYPES))
+def test_bms1_aggregate_registers_are_scoped_to_tss(prefix: str) -> None:
+    expected = {
+        "bms_1_soc": (4058 if prefix == "TSS" else 5777, REGISTER_U16, 1),
+        "bms_1_soh": (4065 if prefix == "TSS" else 5778, REGISTER_U16, 1),
+        "bms_1_toe": (4025 if prefix == "TSS" else 5769, REGISTER_U32 if prefix == "TSS" else REGISTER_U16, 0.1),
+    }
+    inverter_type = SERIAL_PREFIX_TYPES[prefix]
+    for key, (register, data_type, scale) in expected.items():
+        candidates = [description for description in SENSOR_TYPES if description.key == key]
+        original = next(description for description in candidates if description.register in (5769, 5777, 5778))
+        was_supported = plugin_instance.matchInverterWithMask(inverter_type, original.allowedtypes)
+        matching = [
+            description
+            for description in candidates
+            if plugin_instance.matchInverterWithMask(inverter_type, description.allowedtypes, prefix + "0F4L1234", description.blacklist)
+        ]
+        assert len(matching) == int(was_supported)
+        if not was_supported:
+            continue
+        description = matching[0]
+        assert description.register == register
+        assert description.register_type == REG_INPUT
+        assert description.register_data_type == data_type
+        assert description.scale == scale
+        assert description.name == original.name
+        assert description.state_class == original.state_class
+        assert description.entity_registry_enabled_default == original.entity_registry_enabled_default
