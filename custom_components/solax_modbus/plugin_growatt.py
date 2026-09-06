@@ -6452,8 +6452,8 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     GrowattModbusSensorEntityDescription(
-        name="Backup Grid Voltage R",
-        key="backup_grid_voltage_r",
+        name="Backup Grid Voltage L1",
+        key="backup_grid_voltage_l1",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=3287,
@@ -6464,8 +6464,8 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     GrowattModbusSensorEntityDescription(
-        name="Backup Grid Voltage S",
-        key="backup_grid_voltage_s",
+        name="Backup Grid Voltage L2",
+        key="backup_grid_voltage_l2",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=3317,
@@ -6476,8 +6476,8 @@ SENSOR_TYPES: list[GrowattModbusSensorEntityDescription] = [
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     GrowattModbusSensorEntityDescription(
-        name="Backup Grid Voltage T",
-        key="backup_grid_voltage_t",
+        name="Backup Grid Voltage L3",
+        key="backup_grid_voltage_l3",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         register=3318,
