@@ -9,8 +9,8 @@ import pytest
 
 from custom_components.solax_modbus import BlockReadResult, PendingWrite, SolaXModbusHub
 from custom_components.solax_modbus.const import REGISTER_U16, PollOutcome
-from custom_components.solax_modbus.plugin_solax import SENSOR_TYPES_MAIN
 from custom_components.solax_modbus.plugin_sofar import battery_config
+from custom_components.solax_modbus.plugin_solax import SENSOR_TYPES_MAIN
 
 
 def make_hub() -> Any:
