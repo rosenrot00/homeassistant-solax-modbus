@@ -2186,7 +2186,7 @@ class SolaXModbusHub:
 
             if group.readFollowUp is not None:
                 if not await group.readFollowUp(previous_data, data):
-                    _LOGGER.warning("%s: device group validation failed; discarding polling snapshot", self._name)
+                    _LOGGER.warning("%s: device group validation failed; discarding this device group's snapshot", self._name)
                     return PollOutcome.DISCARDED
 
             self._commit_poll_snapshot(previous_data, data)
