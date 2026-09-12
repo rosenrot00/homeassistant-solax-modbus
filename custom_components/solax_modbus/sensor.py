@@ -273,9 +273,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                     if device is not None:
                         batt_pack_model = await battery_config.get_batt_pack_model(hub)
                         batt_pack_sw_version = await battery_config.get_batt_pack_sw_version(hub, new_data, key_prefix)
-                        dev_registry.async_update_device(device.id, sw_version=batt_pack_sw_version, model=batt_pack_model)
                     result = await battery_config.check_battery_on_end(hub, old_data, new_data, key_prefix, batt_nr, batt_pack_nr)
-                    return bool(result)
+                    if not result:
+                        return False
+                    if device is not None:
+                        batt_pack_serial = await battery_config.get_batt_pack_serial(hub, batt_nr, batt_pack_nr)
+                        old_serial = device.serial_number
+                        dev_registry.async_update_device(
+                            device.id, sw_version=batt_pack_sw_version, model=batt_pack_model, serial_number=batt_pack_serial
+                        )
+                        if old_serial != batt_pack_serial:
+                            _LOGGER.warning(
+                                "%s: Battery %s / Pack %s: serial number changed from %r to %r; device information updated",
+                                hub_name,
+                                batt_nr + 1,
+                                batt_pack_nr + 1,
+                                old_serial,
+                                batt_pack_serial,
+                            )
+                    return True
 
                 entityToList(
                     hub,

@@ -466,6 +466,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 # Device groups that a config option can switch off, and the option controlling each.
 # Display names for sub-devices, where a plain title-case of the group key would read badly.
 DEVICE_GROUP_NAMES: dict[str, str] = {
+    "dry_contact": "Dry Contact",
     "external_generator": "External Generator",
     "eps": "EPS",
     "pm": "Parallel",
@@ -474,6 +475,7 @@ DEVICE_GROUP_NAMES: dict[str, str] = {
 }
 
 GATED_DEVICE_GROUPS: dict[str, tuple[str, bool]] = {
+    "dry_contact": (CONF_READ_DCB, DEFAULT_READ_DCB),
     "external_generator": (CONF_READ_GEN, DEFAULT_READ_GEN),
     "eps": (CONF_READ_EPS, DEFAULT_READ_EPS),
     "pm": (CONF_READ_PM, DEFAULT_READ_PM),
@@ -2191,7 +2193,7 @@ class SolaXModbusHub:
 
             if group.readFollowUp is not None:
                 if not await group.readFollowUp(previous_data, data):
-                    _LOGGER.warning("%s: device group validation failed; discarding polling snapshot", self._name)
+                    _LOGGER.warning("%s: device group validation failed; discarding this device group's snapshot", self._name)
                     return PollOutcome.DISCARDED
 
             self._commit_poll_snapshot(previous_data, data)

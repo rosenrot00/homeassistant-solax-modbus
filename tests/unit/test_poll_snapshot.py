@@ -10,6 +10,7 @@ import pytest
 from custom_components.solax_modbus import BlockReadResult, PendingWrite, SolaXModbusHub
 from custom_components.solax_modbus.const import REGISTER_U16, PollOutcome
 from custom_components.solax_modbus.plugin_solax import SENSOR_TYPES_MAIN
+from custom_components.solax_modbus.plugin_sofar import battery_config
 
 
 def make_hub() -> Any:
@@ -568,6 +569,52 @@ async def test_cancelled_read_preparation_returns_skipped() -> None:
     assert result is PollOutcome.SKIPPED
     assert group.publish_updates is False
     hub.async_read_modbus_block.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [None, TimeoutError("BMS read timed out")], ids=["no-response", "exception"])
+async def test_sofar_validation_failure_only_discards_pack_group(response: Any) -> None:
+    """A failed BMS check must not trigger global sleep/slowdown or suppress inverter updates."""
+    hub = make_hub()
+    hub._modbus_addr = 1
+    hub.async_read_holding_registers = AsyncMock(side_effect=[response])
+    config = battery_config(batt_pack_serials={0: {0: "PACK-0"}})
+
+    async def validate_pack(old_data: dict[str, Any], new_data: dict[str, Any]) -> bool:
+        return await config.check_battery_on_end(hub, old_data, new_data, "", 0, 0)
+
+    pack_group = make_group(follow_up=validate_pack)
+    inverter_group = make_group()
+    pack_sensor, inverter_sensor = Mock(), Mock()
+    pack_group.sensors = [pack_sensor]
+    inverter_group.sensors = [inverter_sensor]
+    pack_group.holdingBlocks = [SimpleNamespace(start=1)]
+    inverter_group.holdingBlocks = [SimpleNamespace(start=2)]
+    hub.data.update({"pack_power": 10, "inverter_power": 20, "sleep_none": 30, "sleep_zero": 40})
+    hub.sleepnone = ["sleep_none"]
+    hub.sleepzero = ["sleep_zero"]
+    hub.blocks_changed = False
+    hub.cyclecount = 1
+
+    async def read_block(data: dict[str, Any], block: Any, typ: str) -> BlockReadResult:
+        key = "pack_power" if block.start == 1 else "inverter_power"
+        data[key] = 100
+        return successful_block(key)
+
+    hub.async_read_modbus_block = read_block
+    interval_group = SimpleNamespace(device_groups={"pack": pack_group, "inverter": inverter_group})
+
+    outcome, updated_sensors = await hub._refresh_interval_group_once(interval_group)
+
+    assert outcome is PollOutcome.SUCCESS
+    assert updated_sensors == 1
+    assert hub.data["pack_power"] == 10
+    assert hub.data["inverter_power"] == 100
+    assert hub.data["sleep_none"] == 30
+    assert hub.data["sleep_zero"] == 40
+    assert hub.slowdown == 1
+    pack_sensor.modbus_data_updated.assert_not_called()
+    inverter_sensor.modbus_data_updated.assert_called_once_with()
 
 
 def test_snapshot_commit_preserves_concurrent_local_change() -> None:
